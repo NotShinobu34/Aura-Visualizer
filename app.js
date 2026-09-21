@@ -721,8 +721,8 @@ function validateYouTubePlaylistUrl(urlInput) {
     try {
         const parsed = new URL(trimmed);
         const hostname = parsed.hostname.toLowerCase();
-        const validHosts = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'];
-        const isValidHost = validHosts.some(vh => hostname === vh || hostname.endsWith('.' + vh));
+        const validHosts = ['youtube.com', 'www.youtube.com', 'music.youtube.com', 'youtu.be', 'm.youtube.com'];
+        const isValidHost = validHosts.includes(hostname) || hostname.endsWith('.youtube.com');
         if (!isValidHost) {
             return {
                 valid: false,
@@ -730,18 +730,19 @@ function validateYouTubePlaylistUrl(urlInput) {
             };
         }
 
-        const listId = parsed.searchParams.get('list');
-        if (!listId || !listId.trim()) {
+        const rawListId = parsed.searchParams.get('list');
+        const listId = rawListId ? rawListId.trim() : '';
+        if (!listId) {
             return {
                 valid: false,
                 error: 'No playlist ID found. Ensure the YouTube link contains a "list=" parameter.'
             };
         }
 
-        const cleanPlaylistUrl = `https://www.youtube.com/playlist?list=${encodeURIComponent(listId.trim())}`;
+        const cleanPlaylistUrl = `https://www.youtube.com/playlist?list=${encodeURIComponent(listId)}`;
         return {
             valid: true,
-            playlistId: listId.trim(),
+            playlistId: listId,
             originalUrl: urlInput.trim(),
             normalizedUrl: cleanPlaylistUrl
         };
@@ -819,9 +820,9 @@ async function loadProgressivePlaylist(rawUrl) {
             const { value, done } = await reader.read();
             if (done) break;
 
-            if (thisRequestId !== currentPlaylistRequestId) {
-                console.log(`[Playlist] Ignoring incoming chunk for superseded request #${thisRequestId}`);
-                reader.cancel();
+            if (thisRequestId !== currentPlaylistRequestId || controller.signal.aborted) {
+                console.log(`[Playlist] Ignoring incoming chunk for superseded or aborted request #${thisRequestId}`);
+                reader.cancel().catch(() => {});
                 return;
             }
 
@@ -832,7 +833,7 @@ async function loadProgressivePlaylist(rawUrl) {
             for (const line of lines) {
                 const trimmed = line.trim();
                 if (!trimmed) continue;
-                if (thisRequestId !== currentPlaylistRequestId) return;
+                if (thisRequestId !== currentPlaylistRequestId || controller.signal.aborted) return;
 
                 let msg;
                 try {
@@ -908,7 +909,7 @@ async function loadProgressivePlaylist(rawUrl) {
         }
 
         // Process any remainder line in buffer
-        if (buffer.trim() && thisRequestId === currentPlaylistRequestId) {
+        if (buffer.trim() && thisRequestId === currentPlaylistRequestId && !controller.signal.aborted) {
             try {
                 const msg = JSON.parse(buffer.trim());
                 if (msg.type === 'track' && msg.track) {
@@ -949,7 +950,7 @@ async function loadProgressivePlaylist(rawUrl) {
         }
 
         // If extraction closed cleanly without an explicit done or error event
-        if (!extractionCompleted && thisRequestId === currentPlaylistRequestId) {
+        if (!extractionCompleted && thisRequestId === currentPlaylistRequestId && !controller.signal.aborted) {
             if (tracksLoadedInThisSession > 0) {
                 hideLoadingPopup(`Playlist loaded! (${tracksLoadedInThisSession} tracks)`, 2000);
             } else {
@@ -959,9 +960,8 @@ async function loadProgressivePlaylist(rawUrl) {
         }
 
     } catch (err) {
-        if (thisRequestId !== currentPlaylistRequestId) return;
-        if (err.name === 'AbortError') {
-            console.log(`[Playlist] Request #${thisRequestId} was aborted.`);
+        if (thisRequestId !== currentPlaylistRequestId || controller.signal.aborted || (err && err.name === 'AbortError')) {
+            console.log(`[Playlist] Request #${thisRequestId} was aborted or superseded.`);
             return;
         }
 

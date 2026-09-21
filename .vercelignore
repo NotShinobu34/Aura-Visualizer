@@ -1,0 +1,18 @@
+# Version control & editor
+.git
+.gitignore
+.vscode
+powershell.cmd
+
+# Project documentation & audits
+AUDIT.md
+
+# Legacy deployment files
+render.yaml
+
+# Server & dependencies
+node_modules
+server/node_modules
+server/*-player-script.js
+server/cookies.txt
+.env
