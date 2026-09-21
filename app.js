@@ -368,7 +368,12 @@ linkTabSingle.addEventListener('click', () => switchLinkTab('single'));
 linkTabPlaylist.addEventListener('click', () => switchLinkTab('playlist'));
 
 // Loading Popup Helpers
+let hidePopupTimeout = null;
 function showLoadingPopup(message) {
+    if (hidePopupTimeout) {
+        clearTimeout(hidePopupTimeout);
+        hidePopupTimeout = null;
+    }
     if (loadingPopup && loadingPopupText) {
         loadingPopupText.textContent = message;
         loadingPopup.classList.add('active');
@@ -376,11 +381,16 @@ function showLoadingPopup(message) {
 }
 
 function hideLoadingPopup(successMessage, delay = 2000) {
+    if (hidePopupTimeout) {
+        clearTimeout(hidePopupTimeout);
+        hidePopupTimeout = null;
+    }
     if (loadingPopup && loadingPopupText) {
         if (successMessage) {
             loadingPopupText.textContent = successMessage;
-            setTimeout(() => {
+            hidePopupTimeout = setTimeout(() => {
                 loadingPopup.classList.remove('active');
+                hidePopupTimeout = null;
             }, delay);
         } else {
             loadingPopup.classList.remove('active');
@@ -691,94 +701,296 @@ async function loadSingleYouTubeTrack(rawUrl) {
     }
 }
 
-async function processStreamingUrl(streamUrl, type) {
-    if (!streamUrl || streamUrl.trim() === '') return;
-    
-    // Route single songs cleanly to loadSingleYouTubeTrack
-    if (type === 'single') {
-        return loadSingleYouTubeTrack(streamUrl);
+// Progressive playlist request cancellation & generation tracking
+let activePlaylistController = null;
+let currentPlaylistRequestId = 0;
+
+/**
+ * Validates a YouTube playlist URL.
+ * Requires valid YouTube domain and the presence of a 'list' parameter.
+ */
+function validateYouTubePlaylistUrl(urlInput) {
+    if (!urlInput || typeof urlInput !== 'string' || !urlInput.trim()) {
+        return { valid: false, error: 'Please enter a YouTube playlist URL.' };
+    }
+    let trimmed = urlInput.trim();
+    if (!/^https?:\/\//i.test(trimmed)) {
+        trimmed = 'https://' + trimmed;
     }
 
-    console.log(`Processing streaming URL (${type}):`, streamUrl);
-    
-    // Initialize audio engine if needed
-    if (!audioCtx) initAudioEngine();
-    
-    const isPlaylist = streamUrl.includes('list=') || streamUrl.includes('playlist') || type === 'playlist';
-    
-    if (isPlaylist) {
-        showLoadingPopup('Hold On, Your Playlist Is Fetching');
-    } else {
-        showLoadingPopup('Hold On, Your Song Is Fetching');
-    }
-    
     try {
-        if (isPlaylist) {
-            console.log("Playlist detected. Fetching metadata from Local Backend...");
-            
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 10000);
-            
-            try {
-                const response = await fetch('/api/playlist?url=' + encodeURIComponent(streamUrl), {
-                    signal: controller.signal
-                });
-                clearTimeout(timeoutId);
-                
-                if (!response.ok) throw new Error('Failed to fetch playlist data');
-                
-                const data = await response.json();
-                
-                // Map the tracks and add to our global playlist
-                const newTracks = data.tracks.map(t => ({
-                    name: t.title, 
-                    url: t.url,
-                    isStream: true
-                }));
-                
-                const startIndex = playlist.length;
-                playlist.push(...newTracks);
-                
-                if (playlist.length > 1) {
-                    btnPlaylistToggle.style.display = 'flex';
-                }
-                renderPlaylist();
-                
-                // Enable controls
-                btnPlayPause.disabled = false;
-                btnLoopToggle.disabled = false;
-                btnShuffle.disabled = false;
-                playbackSpeedSelect.disabled = false;
-                btnPrev.disabled = false;
-                btnNext.disabled = false;
-                
-                if (!isPlaying && playlist.length === newTracks.length) {
-                    // if it was empty, load the first track
-                    currentTrackIndex = startIndex;
-                    loadTrack(currentTrackIndex);
-                }
-                
-                hideLoadingPopup('Playlist Loaded!', 2000);
-            } catch (fetchErr) {
-                clearTimeout(timeoutId);
-                throw fetchErr;
-            }
-            
+        const parsed = new URL(trimmed);
+        const hostname = parsed.hostname.toLowerCase();
+        const validHosts = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'];
+        const isValidHost = validHosts.some(vh => hostname === vh || hostname.endsWith('.' + vh));
+        if (!isValidHost) {
+            return {
+                valid: false,
+                error: 'Invalid domain. Please enter a valid YouTube playlist URL.'
+            };
         }
-        
+
+        const listId = parsed.searchParams.get('list');
+        if (!listId || !listId.trim()) {
+            return {
+                valid: false,
+                error: 'No playlist ID found. Ensure the YouTube link contains a "list=" parameter.'
+            };
+        }
+
+        const cleanPlaylistUrl = `https://www.youtube.com/playlist?list=${encodeURIComponent(listId.trim())}`;
+        return {
+            valid: true,
+            playlistId: listId.trim(),
+            originalUrl: urlInput.trim(),
+            normalizedUrl: cleanPlaylistUrl
+        };
+    } catch (e) {
+        return {
+            valid: false,
+            error: 'Malformed URL. Please enter a valid YouTube playlist link.'
+        };
+    }
+}
+
+/**
+ * Progressive YouTube Playlist Workflow
+ * Streams discovered tracks line-by-line using NDJSON (/api/playlist).
+ * Appends tracks to the UI incrementally and begins playing the first track immediately if idle.
+ */
+async function loadProgressivePlaylist(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string' || !rawUrl.trim()) return;
+
+    // 1. Validate playlist URL upfront
+    const validation = validateYouTubePlaylistUrl(rawUrl);
+    if (!validation.valid) {
+        alert(validation.error);
+        return; // Keep modal open for user to correct
+    }
+
+    // Modal accepted: clear input and close modal
+    if (linkInputPlaylist) linkInputPlaylist.value = '';
+    if (linkModal) linkModal.classList.remove('active');
+
+    // 2. Cancellation / Race Protection: Abort any ongoing playlist loading
+    if (activePlaylistController) {
+        console.log('[Playlist] Aborting previous active playlist request');
+        activePlaylistController.abort();
+        activePlaylistController = null;
+    }
+
+    // Unique generation token
+    currentPlaylistRequestId++;
+    const thisRequestId = currentPlaylistRequestId;
+    const controller = new AbortController();
+    activePlaylistController = controller;
+
+    // 3. UI Loading state
+    showLoadingPopup('Connecting to playlist...');
+
+    let tracksLoadedInThisSession = 0;
+    let firstTrackStarted = false;
+    const initialPlaylistLength = playlist.length;
+    let extractionCompleted = false;
+
+    try {
+        const response = await fetch('/api/playlist?url=' + encodeURIComponent(validation.normalizedUrl), {
+            signal: controller.signal
+        });
+
+        if (!response.ok) {
+            let errorMsg = `HTTP ${response.status}`;
+            try {
+                const errJson = await response.json();
+                if (errJson && errJson.error) errorMsg = errJson.error;
+            } catch (e) {}
+            throw new Error(errorMsg);
+        }
+
+        if (!response.body) {
+            throw new Error('ReadableStream not supported by browser or empty response');
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            if (thisRequestId !== currentPlaylistRequestId) {
+                console.log(`[Playlist] Ignoring incoming chunk for superseded request #${thisRequestId}`);
+                reader.cancel();
+                return;
+            }
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // Keep incomplete line in buffer
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                if (thisRequestId !== currentPlaylistRequestId) return;
+
+                let msg;
+                try {
+                    msg = JSON.parse(trimmed);
+                } catch (e) {
+                    continue;
+                }
+
+                if (msg.type === 'init') {
+                    showLoadingPopup('Discovering playlist tracks...');
+                } else if (msg.type === 'track' && msg.track) {
+                    const videoId = msg.track.videoId;
+                    // Deduplicate against already-loaded tracks
+                    const isDuplicate = playlist.some(t =>
+                        (videoId && t.videoId === videoId) ||
+                        (!videoId && t.url === msg.track.url)
+                    );
+
+                    if (!isDuplicate) {
+                        const trackObj = {
+                            name: msg.track.title,
+                            url: msg.track.url,
+                            videoId: msg.track.videoId,
+                            duration: msg.track.duration || 0,
+                            isStream: true
+                        };
+
+                        const trackIndex = playlist.length;
+                        playlist.push(trackObj);
+                        tracksLoadedInThisSession++;
+
+                        // Progressively append track to UI without full DOM rebuild
+                        appendPlaylistTrackUI(trackObj, trackIndex);
+
+                        if (playlist.length > 1 && btnPlaylistToggle) {
+                            btnPlaylistToggle.style.display = 'flex';
+                        }
+
+                        // Enable controls
+                        btnPlayPause.disabled = false;
+                        btnLoopToggle.disabled = false;
+                        btnShuffle.disabled = false;
+                        playbackSpeedSelect.disabled = false;
+                        btnPrev.disabled = false;
+                        btnNext.disabled = false;
+
+                        // Dynamic real-time progress update
+                        showLoadingPopup(`Loading playlist... (${tracksLoadedInThisSession} loaded)`);
+
+                        // If playlist was previously empty and nothing is playing,
+                        // immediately play track #1
+                        if (!isPlaying && initialPlaylistLength === 0 && !firstTrackStarted) {
+                            firstTrackStarted = true;
+                            if (!audioCtx) initAudioEngine();
+                            currentTrackIndex = 0;
+                            loadTrack(0);
+                        }
+                    }
+                } else if (msg.type === 'done') {
+                    extractionCompleted = true;
+                    hideLoadingPopup(`Playlist loaded! (${tracksLoadedInThisSession} tracks)`, 2000);
+                } else if (msg.type === 'error') {
+                    extractionCompleted = true;
+                    if (msg.partial && tracksLoadedInThisSession > 0) {
+                        hideLoadingPopup(`Playlist partially loaded (${tracksLoadedInThisSession} tracks)`, 3000);
+                        console.warn('[Playlist] Extraction ended with error:', msg.message);
+                    } else {
+                        hideLoadingPopup(null);
+                        alert(msg.message || 'Failed to extract playlist tracks.');
+                    }
+                }
+            }
+        }
+
+        // Process any remainder line in buffer
+        if (buffer.trim() && thisRequestId === currentPlaylistRequestId) {
+            try {
+                const msg = JSON.parse(buffer.trim());
+                if (msg.type === 'track' && msg.track) {
+                    const videoId = msg.track.videoId;
+                    const isDuplicate = playlist.some(t =>
+                        (videoId && t.videoId === videoId) ||
+                        (!videoId && t.url === msg.track.url)
+                    );
+                    if (!isDuplicate) {
+                        const trackObj = {
+                            name: msg.track.title,
+                            url: msg.track.url,
+                            videoId: msg.track.videoId,
+                            duration: msg.track.duration || 0,
+                            isStream: true
+                        };
+                        const trackIndex = playlist.length;
+                        playlist.push(trackObj);
+                        tracksLoadedInThisSession++;
+                        appendPlaylistTrackUI(trackObj, trackIndex);
+
+                        if (playlist.length > 1 && btnPlaylistToggle) {
+                            btnPlaylistToggle.style.display = 'flex';
+                        }
+
+                        if (!isPlaying && initialPlaylistLength === 0 && !firstTrackStarted) {
+                            firstTrackStarted = true;
+                            if (!audioCtx) initAudioEngine();
+                            currentTrackIndex = 0;
+                            loadTrack(0);
+                        }
+                    }
+                } else if (msg.type === 'done') {
+                    extractionCompleted = true;
+                    hideLoadingPopup(`Playlist loaded! (${tracksLoadedInThisSession} tracks)`, 2000);
+                }
+            } catch (e) {}
+        }
+
+        // If extraction closed cleanly without an explicit done or error event
+        if (!extractionCompleted && thisRequestId === currentPlaylistRequestId) {
+            if (tracksLoadedInThisSession > 0) {
+                hideLoadingPopup(`Playlist loaded! (${tracksLoadedInThisSession} tracks)`, 2000);
+            } else {
+                hideLoadingPopup(null);
+                alert('No playable tracks found in this playlist.');
+            }
+        }
+
     } catch (err) {
-        console.error("Error loading YouTube link:", err);
-        console.error("Detailed Network Error:", err);
-        hideLoadingPopup(null);
+        if (thisRequestId !== currentPlaylistRequestId) return;
         if (err.name === 'AbortError') {
-            alert('Playlist taking too long. Please try a shorter link.');
+            console.log(`[Playlist] Request #${thisRequestId} was aborted.`);
+            return;
+        }
+
+        console.error('[Playlist] Error processing playlist stream:', err);
+        if (tracksLoadedInThisSession > 0) {
+            hideLoadingPopup(`Playlist partially loaded (${tracksLoadedInThisSession} tracks)`, 3000);
+            alert(`Playlist partially loaded (${tracksLoadedInThisSession} tracks). Error: ${err.message || 'Stream ended unexpectedly'}`);
         } else {
-            alert('Failed to load YouTube link. Make sure the proxy server is running.');
+            hideLoadingPopup(null);
+            alert('Failed to load playlist. Ensure the backend proxy server is running and the URL is valid.');
+        }
+    } finally {
+        if (activePlaylistController === controller) {
+            activePlaylistController = null;
         }
     }
-    
-    if (linkModal) {
-        linkModal.classList.remove('active');
+}
+
+/**
+ * Universal streaming URL dispatcher.
+ * Preserves legacy entry points while cleanly routing single songs and playlists.
+ */
+async function processStreamingUrl(streamUrl, type) {
+    if (!streamUrl || streamUrl.trim() === '') return;
+    const isPlaylist = type === 'playlist' || streamUrl.includes('list=') || streamUrl.includes('/playlist');
+    if (isPlaylist) {
+        return loadProgressivePlaylist(streamUrl);
+    } else {
+        return loadSingleYouTubeTrack(streamUrl);
     }
 }
 
@@ -786,10 +998,25 @@ btnLoadSong.addEventListener('click', () => {
     loadSingleYouTubeTrack(linkInputSingle.value.trim());
 });
 
+if (linkInputSingle) {
+    linkInputSingle.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            loadSingleYouTubeTrack(linkInputSingle.value.trim());
+        }
+    });
+}
+
 btnLoadPlaylist.addEventListener('click', () => {
-    processStreamingUrl(linkInputPlaylist.value.trim(), 'playlist');
-    linkInputPlaylist.value = '';
+    loadProgressivePlaylist(linkInputPlaylist.value.trim());
 });
+
+if (linkInputPlaylist) {
+    linkInputPlaylist.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            loadProgressivePlaylist(linkInputPlaylist.value.trim());
+        }
+    });
+}
 
 // 2.5 File/Folder Upload & Playlist Logic
 function processAudioFiles(files) {
@@ -863,22 +1090,44 @@ if (confirmBtn) {
     });
 }
 
+function updatePlaylistHeader() {
+    const playlistHeader = document.getElementById('playlist-header');
+    if (playlistHeader) {
+        playlistHeader.textContent = `PLAYLIST [${playlist.length}]`;
+    }
+}
+
+function appendPlaylistTrackUI(file, index) {
+    if (!playlistContainer) return;
+    const li = document.createElement('li');
+    li.textContent = file.name || 'YouTube Audio';
+    if (index === currentTrackIndex) {
+        li.classList.add('active-track');
+    }
+    li.addEventListener('click', () => {
+        currentTrackIndex = index;
+        loadTrack(currentTrackIndex);
+    });
+    playlistContainer.appendChild(li);
+    updatePlaylistHeader();
+}
+
 function renderPlaylist() {
+    if (!playlistContainer) return;
     playlistContainer.innerHTML = '';
     playlist.forEach((file, index) => {
         const li = document.createElement('li');
-        li.textContent = file.name;
+        li.textContent = file.name || 'YouTube Audio';
+        if (index === currentTrackIndex) {
+            li.classList.add('active-track');
+        }
         li.addEventListener('click', () => {
             currentTrackIndex = index;
             loadTrack(currentTrackIndex);
         });
         playlistContainer.appendChild(li);
     });
-
-    const playlistHeader = document.getElementById('playlist-header');
-    if (playlistHeader) {
-        playlistHeader.textContent = `PLAYLIST [${playlist.length}]`;
-    }
+    updatePlaylistHeader();
 }
 
 function preloadNextTrack(nextTrackUrl) {

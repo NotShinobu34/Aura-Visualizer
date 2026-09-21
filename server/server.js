@@ -10,6 +10,7 @@ const cors = require('cors');
 const youtubedl = require('youtube-dl-exec');
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -259,48 +260,120 @@ app.get('/api/stream', (req, res) => {
     });
 });
 
-app.get('/api/playlist', async (req, res) => {
+app.get('/api/playlist', (req, res) => {
     const playlistUrl = req.query.url;
     if (!playlistUrl) return res.status(400).json({ error: 'No URL provided' });
 
-    console.log(`[/api/playlist] Fetching metadata for: ${playlistUrl}`);
+    console.log(`[/api/playlist] Progressive extraction started for: ${playlistUrl}`);
 
-    try {
-        // 'flat-playlist' + 'skip-download' is the fastest way to list tracks
-        // We pass timeout: 10000 inside spawn options (3rd arg) to terminate subprocess if it hangs,
-        // and socketTimeout: 10 in the flags (2nd arg) to avoid socket hang.
-        const output = await youtubedl(playlistUrl, {
-            dumpSingleJson: true,
-            flatPlaylist: true,
-            skipDownload: true,
-            quiet: true,
-            noWarnings: true,
-            socketTimeout: 10,
-            ...(hasCookies && { cookies: cookiesPath })
-        }, {
-            timeout: 10000
-        });
-
-        if (!output || !output.entries) {
-            return res.status(404).send('Playlist error');
-        }
-
-        // Map the data
-        const tracks = output.entries.map((entry) => ({
-            title: entry.title || 'Unknown Track',
-            url: entry.url || entry.webpage_url || `https://www.youtube.com/watch?v=${entry.id}`
-        }));
-
-        res.json({
-            playlistTitle: output.title || 'YouTube Playlist',
-            trackCount: tracks.length,
-            tracks: tracks
-        });
-
-    } catch (err) {
-        console.error('[/api/playlist] Error:', err.message);
-        res.status(500).json({ error: 'Playlist fetch timed out or failed.' });
+    // Set headers for line-delimited JSON (NDJSON) streaming
+    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
     }
+
+    let isTerminated = false;
+    let trackCount = 0;
+
+    // Send init event
+    res.write(JSON.stringify({ type: 'init', url: playlistUrl }) + '\n');
+
+    // Spawn yt-dlp with dumpJson (one JSON object per line) + flatPlaylist
+    const subprocess = youtubedl.exec(playlistUrl, {
+        dumpJson: true,
+        flatPlaylist: true,
+        skipDownload: true,
+        noWarnings: true,
+        quiet: true,
+        socketTimeout: 15,
+        ...(hasCookies && { cookies: cookiesPath })
+    }, {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 120000 // 2-minute safety ceiling for large playlists
+    });
+
+    const rl = readline.createInterface({
+        input: subprocess.stdout,
+        crlfDelay: Infinity
+    });
+
+    rl.on('line', (line) => {
+        if (isTerminated) return;
+        const trimmed = line.trim();
+        if (!trimmed) return;
+
+        try {
+            const entry = JSON.parse(trimmed);
+            if (!entry || !entry.id) return;
+            // Filter deleted, private, or unavailable videos
+            if (entry.title === '[Private video]' || entry.title === '[Deleted video]' || entry.title === '[Unavailable video]') {
+                return;
+            }
+
+            trackCount++;
+            const track = {
+                videoId: entry.id,
+                title: (typeof entry.title === 'string' && entry.title.trim().length > 0) ? entry.title.trim() : `Track ${trackCount}`,
+                url: entry.url && entry.url.startsWith('http') ? entry.url : `https://www.youtube.com/watch?v=${entry.id}`,
+                duration: typeof entry.duration === 'number' && isFinite(entry.duration) && entry.duration >= 0 ? entry.duration : 0
+            };
+
+            res.write(JSON.stringify({ type: 'track', track }) + '\n');
+        } catch (e) {
+            // Non-fatal parse error on malformed line
+        }
+    });
+
+    function cleanup() {
+        if (isTerminated) return;
+        isTerminated = true;
+        rl.close();
+        if (subprocess && !subprocess.killed) {
+            try {
+                subprocess.kill('SIGTERM');
+            } catch (e) {}
+        }
+    }
+
+    subprocess.on('close', (code) => {
+        if (isTerminated) return;
+        if (code === 0) {
+            console.log(`[/api/playlist] Extraction finished successfully. Total tracks: ${trackCount}`);
+            res.write(JSON.stringify({ type: 'done', count: trackCount }) + '\n');
+        } else {
+            console.warn(`[/api/playlist] Extraction ended with exit code ${code}. Total tracks found: ${trackCount}`);
+            if (trackCount > 0) {
+                res.write(JSON.stringify({ type: 'error', message: `Playlist extraction ended with code ${code}`, partial: true, count: trackCount }) + '\n');
+            } else {
+                res.write(JSON.stringify({ type: 'error', message: 'Failed to extract playlist tracks. Verify the URL or cookies.', partial: false, count: 0 }) + '\n');
+            }
+        }
+        res.end();
+        cleanup();
+    });
+
+    subprocess.catch((err) => {
+        if (isTerminated) return;
+        console.error('[/api/playlist] Subprocess error:', err.message);
+        if (trackCount > 0) {
+            res.write(JSON.stringify({ type: 'error', message: err.message, partial: true, count: trackCount }) + '\n');
+        } else {
+            res.write(JSON.stringify({ type: 'error', message: err.message, partial: false, count: 0 }) + '\n');
+        }
+        res.end();
+        cleanup();
+    });
+
+    req.on('close', () => {
+        if (!isTerminated) {
+            console.log(`[/api/playlist] Client closed connection for: ${playlistUrl}`);
+            cleanup();
+        }
+    });
 });
 
 // ─────────────────── Boot ───────────────────
