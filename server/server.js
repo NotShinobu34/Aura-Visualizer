@@ -64,19 +64,34 @@ app.get('/api/info', async (req, res) => {
             quiet: true,
             skipDownload: true,
             ...(hasCookies && { cookies: cookiesPath })
+        }, {
+            timeout: 15000
         });
 
+        // Normalize duration to a finite positive number in seconds or 0
+        let parsedDuration = 0;
+        if (typeof info.duration === 'number' && isFinite(info.duration) && info.duration >= 0) {
+            parsedDuration = info.duration;
+        } else if (typeof info.duration === 'string') {
+            const num = parseFloat(info.duration);
+            if (isFinite(num) && num >= 0) parsedDuration = num;
+        }
+
         res.json({
-            title:     info.title,
-            duration:  info.duration,
+            title:     (typeof info.title === 'string' && info.title.trim().length > 0) ? info.title.trim() : 'YouTube Audio',
+            duration:  parsedDuration,
             thumbnail: info.thumbnail || null,
             channel:   info.channel || info.uploader || 'Unknown',
+            videoId:   info.id || null,
             views:     info.view_count || 0
         });
     } catch (err) {
         console.error(`[/api/info] Extraction failed: ${err.message}`);
         if (!res.headersSent) {
-            res.status(500).json({ error: 'Failed to fetch video info.', details: err.message });
+            const isTimeout = err.timedOut || (err.message && err.message.toLowerCase().includes('timed out'));
+            const statusCode = isTimeout ? 504 : 500;
+            const errorMsg = isTimeout ? 'Metadata fetch timed out.' : 'Failed to fetch video info.';
+            res.status(statusCode).json({ error: errorMsg, details: err.message });
         }
     }
 });

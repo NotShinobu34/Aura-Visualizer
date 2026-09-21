@@ -388,9 +388,317 @@ function hideLoadingPopup(successMessage, delay = 2000) {
     }
 }
 
+// --- YouTube Helpers & Single Song Metadata Workflow ---
+
+/**
+ * Single source of truth for extracting an 11-character YouTube video ID.
+ * Safely handles standard watch URLs, youtu.be, shorts, embeds, and music.youtube.com.
+ * Returns null if the URL is invalid or does not contain an 11-character video ID.
+ */
+function extractYouTubeVideoId(urlInput) {
+    if (!urlInput || typeof urlInput !== 'string') return null;
+    let trimmed = urlInput.trim();
+    if (!trimmed) return null;
+
+    if (!/^https?:\/\//i.test(trimmed)) {
+        trimmed = 'https://' + trimmed;
+    }
+
+    try {
+        const parsed = new URL(trimmed);
+        const hostname = parsed.hostname.toLowerCase();
+        
+        const isStandard = hostname === 'youtube.com' || hostname.endsWith('.youtube.com');
+        const isShort = hostname === 'youtu.be';
+
+        if (!isStandard && !isShort) return null;
+
+        // 1. youtu.be/<id>
+        if (isShort) {
+            const pathParts = parsed.pathname.split('/').filter(Boolean);
+            if (pathParts.length > 0 && /^[a-zA-Z0-9_-]{11}$/.test(pathParts[0])) {
+                return pathParts[0];
+            }
+            return null;
+        }
+
+        // 2. Standard watch URL: youtube.com/watch?v=<id>
+        const vParam = parsed.searchParams.get('v');
+        if (vParam && /^[a-zA-Z0-9_-]{11}$/.test(vParam)) {
+            return vParam;
+        }
+
+        // 3. Shorts: youtube.com/shorts/<id>
+        if (parsed.pathname.startsWith('/shorts/')) {
+            const shortParts = parsed.pathname.replace('/shorts/', '').split('/').filter(Boolean);
+            if (shortParts.length > 0 && /^[a-zA-Z0-9_-]{11}$/.test(shortParts[0])) {
+                return shortParts[0];
+            }
+        }
+
+        // 4. Embed: youtube.com/embed/<id>
+        if (parsed.pathname.startsWith('/embed/')) {
+            const embedParts = parsed.pathname.replace('/embed/', '').split('/').filter(Boolean);
+            if (embedParts.length > 0 && /^[a-zA-Z0-9_-]{11}$/.test(embedParts[0])) {
+                return embedParts[0];
+            }
+        }
+
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Validates a YouTube URL using the URL API and extractYouTubeVideoId().
+ * Allows harmless extra query parameters (e.g. list, index, si, feature, t).
+ * Rejects non-YouTube domains, non-HTTP/HTTPS protocols, malformed URLs, and missing IDs.
+ */
+function validateYouTubeUrl(urlInput) {
+    if (!urlInput || typeof urlInput !== 'string' || !urlInput.trim()) {
+        return { valid: false, error: 'Please enter a YouTube video URL.' };
+    }
+    const trimmed = urlInput.trim();
+    const videoId = extractYouTubeVideoId(trimmed);
+    if (!videoId) {
+        return {
+            valid: false,
+            error: 'Invalid YouTube URL. Please enter a valid YouTube video, Music, Shorts, or youtu.be link.'
+        };
+    }
+    return {
+        valid: true,
+        videoId: videoId,
+        originalUrl: trimmed,
+        normalizedUrl: `https://www.youtube.com/watch?v=${videoId}`
+    };
+}
+
+/**
+ * Normalizes metadata fields defensively to prevent undefined, null, or empty values.
+ */
+function normalizeMetadata(data, videoId) {
+    const safeVideoId = (videoId && typeof videoId === 'string') ? videoId.trim() : '';
+    const fallbackTitle = safeVideoId ? `YouTube Audio (${safeVideoId})` : 'YouTube Audio';
+
+    if (!data || typeof data !== 'object') {
+        return {
+            title: fallbackTitle,
+            duration: 0,
+            thumbnail: null,
+            channel: 'YouTube',
+            videoId: safeVideoId,
+            isFallback: true
+        };
+    }
+
+    const rawTitle = typeof data.title === 'string' ? data.title.trim() : '';
+    const title = rawTitle.length > 0 ? rawTitle : fallbackTitle;
+
+    let duration = 0;
+    if (typeof data.duration === 'number' && isFinite(data.duration) && data.duration >= 0) {
+        duration = data.duration;
+    } else if (typeof data.duration === 'string') {
+        const parsed = parseFloat(data.duration);
+        if (isFinite(parsed) && parsed >= 0) {
+            duration = parsed;
+        }
+    }
+
+    const thumbnail = (typeof data.thumbnail === 'string' && data.thumbnail.trim().length > 0)
+        ? data.thumbnail.trim()
+        : null;
+
+    const channel = (typeof data.channel === 'string' && data.channel.trim().length > 0)
+        ? data.channel.trim()
+        : (typeof data.uploader === 'string' && data.uploader.trim().length > 0 ? data.uploader.trim() : 'Unknown');
+
+    return {
+        title,
+        duration,
+        thumbnail,
+        channel,
+        videoId: safeVideoId,
+        isFallback: !rawTitle
+    };
+}
+
+/**
+ * Pure metadata fetcher calling /api/info with timeout and abort support.
+ * Returns { success: boolean, data?: object, error?: string }
+ */
+async function fetchTrackMetadata(targetUrl, signal) {
+    const infoUrl = `/api/info?url=${encodeURIComponent(targetUrl)}`;
+    const internalTimeout = new AbortController();
+    const timeoutId = setTimeout(() => internalTimeout.abort(), 15000);
+
+    const abortHandler = () => internalTimeout.abort();
+    if (signal) {
+        signal.addEventListener('abort', abortHandler);
+    }
+
+    try {
+        const response = await fetch(infoUrl, { signal: internalTimeout.signal });
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            const errJson = await response.json().catch(() => ({}));
+            return {
+                success: false,
+                error: errJson.error || `HTTP ${response.status}`
+            };
+        }
+
+        const data = await response.json();
+        return { success: true, data };
+    } catch (err) {
+        clearTimeout(timeoutId);
+        return {
+            success: false,
+            error: err.name === 'AbortError' ? 'Metadata request timed out or was cancelled' : err.message
+        };
+    } finally {
+        if (signal) {
+            signal.removeEventListener('abort', abortHandler);
+        }
+    }
+}
+
+// Request generation and active controller for race/stale protection
+let activeMetadataController = null;
+let currentMetadataRequestId = 0;
+
+/**
+ * Refactored Single YouTube Song Workflow
+ * Responsibilities: URL validation -> Metadata fetching -> Track creation -> Immediate UI binding -> Audio stream playback
+ */
+async function loadSingleYouTubeTrack(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string' || !rawUrl.trim()) return;
+
+    // 1. Validate URL upfront using URL API
+    const validation = validateYouTubeUrl(rawUrl);
+    if (!validation.valid) {
+        alert(validation.error);
+        return; // Keep modal open for user to correct
+    }
+
+    // Modal accepted: clear single input and close modal
+    if (linkInputSingle) linkInputSingle.value = '';
+    if (linkModal) linkModal.classList.remove('active');
+
+    // 2. Stale Request / Race Protection: Cancel any ongoing metadata request
+    if (activeMetadataController) {
+        activeMetadataController.abort();
+        activeMetadataController = null;
+    }
+
+    // Generate unique request ID token
+    currentMetadataRequestId++;
+    const thisRequestId = currentMetadataRequestId;
+    const controller = new AbortController();
+    activeMetadataController = controller;
+
+    // 3. UI Loading state: Do NOT claim song is loaded yet
+    showLoadingPopup('Fetching Track Info...');
+
+    try {
+        // 4. Fetch metadata first (decoupled from audio streaming)
+        const metaResult = await fetchTrackMetadata(validation.normalizedUrl, controller.signal);
+
+        // Check if a newer request has been made while waiting
+        if (thisRequestId !== currentMetadataRequestId) {
+            console.log(`[SingleSong] Discarding stale response for request ID #${thisRequestId}`);
+            return;
+        }
+        activeMetadataController = null;
+
+        // 5. Normalize metadata or use safe fallback title
+        const meta = metaResult.success
+            ? normalizeMetadata(metaResult.data, validation.videoId)
+            : normalizeMetadata(null, validation.videoId);
+
+        if (!metaResult.success) {
+            console.warn('[SingleSong] Metadata fetch failed or timed out:', metaResult.error, '- using fallback title:', meta.title);
+        }
+
+        // 6. Create track object
+        const newTrack = {
+            name: meta.title,
+            url: validation.normalizedUrl,
+            isStream: true,
+            duration: meta.duration,
+            thumbnail: meta.thumbnail,
+            channel: meta.channel,
+            videoId: meta.videoId,
+            originalUrl: validation.originalUrl
+        };
+
+        // 7. Add track to playlist & update playlist UI
+        const newTrackIndex = playlist.length;
+        playlist.push(newTrack);
+
+        if (playlist.length > 1 && btnPlaylistToggle) {
+            btnPlaylistToggle.style.display = 'flex';
+        }
+        renderPlaylist();
+
+        // 8. Immediate UI metadata binding (DO NOT wait for stream or native loadedmetadata)
+        trackNameLabel.textContent = newTrack.name;
+        currentTimeEl.textContent = '0:00';
+        totalTimeEl.textContent = formatTime(newTrack.duration);
+        progressBar.value = 0;
+        const themePrimary = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim();
+        progressBar.style.background = `linear-gradient(to right, rgba(${themePrimary}, 1) 0%, rgba(255, 255, 255, 0.1) 0%)`;
+
+        // Smart marquee check for title overflow
+        const titleContainer = document.querySelector('.track-title-container');
+        trackNameLabel.classList.remove('is-scrolling');
+        setTimeout(() => {
+            if (titleContainer && trackNameLabel.scrollWidth > titleContainer.clientWidth) {
+                trackNameLabel.classList.add('is-scrolling');
+            }
+        }, 50);
+
+        // 9. Enable player controls
+        btnPlayPause.disabled = false;
+        btnLoopToggle.disabled = false;
+        btnShuffle.disabled = false;
+        playbackSpeedSelect.disabled = false;
+        btnPrev.disabled = false;
+        btnNext.disabled = false;
+
+        // 10. Initialize audio engine (within user activation lifecycle) if required
+        if (!audioCtx) initAudioEngine();
+
+        // 11. Inform user of status
+        if (meta.isFallback) {
+            hideLoadingPopup('Song Info Unavailable - Streaming Directly', 2000);
+        } else {
+            hideLoadingPopup('Song Loaded!', 1500);
+        }
+
+        // 12. Only now invoke loadTrack() to start audio streaming (/api/stream)
+        currentTrackIndex = newTrackIndex;
+        loadTrack(currentTrackIndex);
+
+    } catch (err) {
+        if (thisRequestId !== currentMetadataRequestId) return;
+        activeMetadataController = null;
+        console.error('[SingleSong] Unexpected error in single song flow:', err);
+        hideLoadingPopup(null);
+        alert('Failed to process YouTube song. Please try again.');
+    }
+}
+
 async function processStreamingUrl(streamUrl, type) {
     if (!streamUrl || streamUrl.trim() === '') return;
     
+    // Route single songs cleanly to loadSingleYouTubeTrack
+    if (type === 'single') {
+        return loadSingleYouTubeTrack(streamUrl);
+    }
+
     console.log(`Processing streaming URL (${type}):`, streamUrl);
     
     // Initialize audio engine if needed
@@ -456,37 +764,6 @@ async function processStreamingUrl(streamUrl, type) {
                 throw fetchErr;
             }
             
-        } else {
-            console.log("Single song detected.");
-            
-            const newTrack = {
-                name: 'YouTube Stream', // Placeholder, plays immediately
-                url: streamUrl,
-                isStream: true
-            };
-            
-            const startIndex = playlist.length;
-            playlist.push(newTrack);
-            
-            if (playlist.length > 1) {
-                btnPlaylistToggle.style.display = 'flex';
-            }
-            renderPlaylist();
-            
-            // Enable controls
-            btnPlayPause.disabled = false;
-            btnLoopToggle.disabled = false;
-            btnShuffle.disabled = false;
-            playbackSpeedSelect.disabled = false;
-            btnPrev.disabled = false;
-            btnNext.disabled = false;
-            
-            if (!isPlaying && playlist.length === 1) {
-                currentTrackIndex = startIndex;
-                loadTrack(currentTrackIndex);
-            }
-            
-            hideLoadingPopup('Song Loaded!', 2000);
         }
         
     } catch (err) {
@@ -506,8 +783,7 @@ async function processStreamingUrl(streamUrl, type) {
 }
 
 btnLoadSong.addEventListener('click', () => {
-    processStreamingUrl(linkInputSingle.value.trim(), 'single');
-    linkInputSingle.value = '';
+    loadSingleYouTubeTrack(linkInputSingle.value.trim());
 });
 
 btnLoadPlaylist.addEventListener('click', () => {
@@ -628,7 +904,16 @@ function loadTrack(index) {
     if (file.isStream) {
         // Stream from the local backend proxy
         fileURL = `/api/stream?url=${encodeURIComponent(file.url)}`;
-        trackNameLabel.textContent = file.name || 'YouTube Stream';
+        trackNameLabel.textContent = file.name || 'YouTube Audio';
+        
+        // Immediate timeline binding from metadata duration if available
+        if (file.duration && isFinite(file.duration) && file.duration > 0) {
+            totalTimeEl.textContent = formatTime(file.duration);
+        } else {
+            totalTimeEl.textContent = '0:00';
+        }
+        currentTimeEl.textContent = '0:00';
+        progressBar.value = 0;
         
         // Clear hover waveform canvas since we cannot easily pre-render a remote stream
         const hoverCanvas = document.getElementById('waveform-hover-canvas');
@@ -747,28 +1032,64 @@ audioSource.addEventListener('pause', () => {
 
 // --- Timeline Logic ---
 function formatTime(seconds) {
-    if (isNaN(seconds) || !isFinite(seconds)) return '0:00';
+    if (isNaN(seconds) || !isFinite(seconds) || seconds < 0) return '0:00';
     const min = Math.floor(seconds / 60);
     const sec = Math.floor(seconds % 60);
     return `${min}:${sec < 10 ? '0' : ''}${sec}`;
 }
 
 audioSource.addEventListener('timeupdate', () => {
-    if (!audioSource.duration) return;
+    const currentTrack = playlist[currentTrackIndex];
+    // For local files, native duration is finite and valid.
+    // For remote streams with chunked/live headers, fallback to metadata duration when native duration is invalid.
+    const isNativeValid = isFinite(audioSource.duration) && audioSource.duration > 0;
+    const duration = isNativeValid
+        ? audioSource.duration
+        : (currentTrack && currentTrack.duration && isFinite(currentTrack.duration) ? currentTrack.duration : 0);
+
+    if (duration <= 0) return;
     
-    const progressPercent = (audioSource.currentTime / audioSource.duration) * 100;
+    const curTime = (isFinite(audioSource.currentTime) && audioSource.currentTime >= 0) ? audioSource.currentTime : 0;
+    const progressPercent = Math.min(100, Math.max(0, (curTime / duration) * 100));
     progressBar.value = progressPercent;
     
-    progressBar.style.background = `linear-gradient(to right, rgba(${getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim()}, 1) ${progressPercent}%, rgba(255, 255, 255, 0.1) ${progressPercent}%)`;
+    const themePrimary = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim();
+    progressBar.style.background = `linear-gradient(to right, rgba(${themePrimary}, 1) ${progressPercent}%, rgba(255, 255, 255, 0.1) ${progressPercent}%)`;
     
-    currentTimeEl.textContent = formatTime(audioSource.currentTime);
-    totalTimeEl.textContent = formatTime(audioSource.duration);
+    currentTimeEl.textContent = formatTime(curTime);
+    totalTimeEl.textContent = formatTime(duration);
 });
 
 progressBar.addEventListener('input', () => {
-    if (!audioSource.duration) return;
-    const seekTime = (progressBar.value / 100) * audioSource.duration;
-    audioSource.currentTime = seekTime;
+    const currentTrack = playlist[currentTrackIndex];
+    const isNativeValid = isFinite(audioSource.duration) && audioSource.duration > 0;
+    const duration = isNativeValid
+        ? audioSource.duration
+        : (currentTrack && currentTrack.duration && isFinite(currentTrack.duration) ? currentTrack.duration : 0);
+
+    if (!duration || !isFinite(duration) || duration <= 0) return;
+
+    const percent = parseFloat(progressBar.value);
+    if (isNaN(percent) || !isFinite(percent)) return;
+
+    const seekTime = (percent / 100) * duration;
+    if (isFinite(seekTime) && seekTime >= 0) {
+        try {
+            audioSource.currentTime = seekTime;
+        } catch (seekErr) {
+            console.warn('[AudioPlayer] Defensive seek failed safely:', seekErr);
+        }
+    }
+});
+
+// Update duration when native metadata is loaded if finite
+audioSource.addEventListener('loadedmetadata', () => {
+    const currentTrack = playlist[currentTrackIndex];
+    if (isFinite(audioSource.duration) && audioSource.duration > 0) {
+        totalTimeEl.textContent = formatTime(audioSource.duration);
+    } else if (currentTrack && currentTrack.duration > 0) {
+        totalTimeEl.textContent = formatTime(currentTrack.duration);
+    }
 });
 
 // 3. Play/Pause
