@@ -786,6 +786,9 @@ async function loadProgressivePlaylist(rawUrl) {
     const controller = new AbortController();
     activePlaylistController = controller;
 
+    const isStaleRequest = () =>
+        thisRequestId !== currentPlaylistRequestId || controller.signal.aborted;
+
     // 3. UI Loading state
     showLoadingPopup('Connecting to playlist...');
 
@@ -820,7 +823,7 @@ async function loadProgressivePlaylist(rawUrl) {
             const { value, done } = await reader.read();
             if (done) break;
 
-            if (thisRequestId !== currentPlaylistRequestId || controller.signal.aborted) {
+            if (isStaleRequest()) {
                 console.log(`[Playlist] Ignoring incoming chunk for superseded or aborted request #${thisRequestId}`);
                 reader.cancel().catch(() => {});
                 return;
@@ -833,7 +836,7 @@ async function loadProgressivePlaylist(rawUrl) {
             for (const line of lines) {
                 const trimmed = line.trim();
                 if (!trimmed) continue;
-                if (thisRequestId !== currentPlaylistRequestId || controller.signal.aborted) return;
+                if (isStaleRequest()) return;
 
                 let msg;
                 try {
@@ -870,6 +873,11 @@ async function loadProgressivePlaylist(rawUrl) {
 
                         if (playlist.length > 1 && btnPlaylistToggle) {
                             btnPlaylistToggle.style.display = 'flex';
+                        }
+
+                        // Trigger warming if this newly arrived track is the immediate upcoming candidate
+                        if (isPlaying && (trackIndex === currentTrackIndex + 1 || (isShuffle && nextShuffleCandidateIndex === -1))) {
+                            warmUpcomingTrack();
                         }
 
                         // Enable controls
@@ -909,10 +917,11 @@ async function loadProgressivePlaylist(rawUrl) {
         }
 
         // Process any remainder line in buffer
-        if (buffer.trim() && thisRequestId === currentPlaylistRequestId && !controller.signal.aborted) {
+        if (buffer.trim() && !isStaleRequest()) {
             try {
                 const msg = JSON.parse(buffer.trim());
                 if (msg.type === 'track' && msg.track) {
+                    if (isStaleRequest()) return;
                     const videoId = msg.track.videoId;
                     const isDuplicate = playlist.some(t =>
                         (videoId && t.videoId === videoId) ||
@@ -935,6 +944,11 @@ async function loadProgressivePlaylist(rawUrl) {
                             btnPlaylistToggle.style.display = 'flex';
                         }
 
+                        // Trigger warming if this newly arrived track is the immediate upcoming candidate
+                        if (isPlaying && (trackIndex === currentTrackIndex + 1 || (isShuffle && nextShuffleCandidateIndex === -1))) {
+                            warmUpcomingTrack();
+                        }
+
                         if (!isPlaying && initialPlaylistLength === 0 && !firstTrackStarted) {
                             firstTrackStarted = true;
                             if (!audioCtx) initAudioEngine();
@@ -950,7 +964,7 @@ async function loadProgressivePlaylist(rawUrl) {
         }
 
         // If extraction closed cleanly without an explicit done or error event
-        if (!extractionCompleted && thisRequestId === currentPlaylistRequestId && !controller.signal.aborted) {
+        if (!extractionCompleted && !isStaleRequest()) {
             if (tracksLoadedInThisSession > 0) {
                 hideLoadingPopup(`Playlist loaded! (${tracksLoadedInThisSession} tracks)`, 2000);
             } else {
@@ -960,7 +974,7 @@ async function loadProgressivePlaylist(rawUrl) {
         }
 
     } catch (err) {
-        if (thisRequestId !== currentPlaylistRequestId || controller.signal.aborted || (err && err.name === 'AbortError')) {
+        if (isStaleRequest() || err?.name === 'AbortError') {
             console.log(`[Playlist] Request #${thisRequestId} was aborted or superseded.`);
             return;
         }
@@ -1130,15 +1144,410 @@ function renderPlaylist() {
     updatePlaylistHeader();
 }
 
-function preloadNextTrack(nextTrackUrl) {
-    console.log("Pre-loading next track in background: " + nextTrackUrl);
-    // Silent fetch triggers backend yt-dlp buffer without auto-playing here
-    fetch('/api/stream?url=' + encodeURIComponent(nextTrackUrl))
-        .catch(err => console.log('Preload silently failed/aborted:', err));
+// ─────────────────── Lightweight Pre-warming System ───────────────────
+const warmCache = new Map();
+const MAX_CLIENT_WARM_CACHE = 10;
+const CLIENT_WARM_TTL_MS = 10 * 60 * 1000; // 10 minutes
+let activeWarmController = null;
+let currentWarmRequestId = 0;
+let nextShuffleCandidateIndex = -1;
+
+function pruneClientWarmCache() {
+    const now = Date.now();
+    for (const [key, entry] of warmCache.entries()) {
+        if (now - entry.timestamp > CLIENT_WARM_TTL_MS) {
+            warmCache.delete(key);
+        }
+    }
+    while (warmCache.size > MAX_CLIENT_WARM_CACHE) {
+        const oldestKey = warmCache.keys().next().value;
+        if (oldestKey) warmCache.delete(oldestKey);
+        else break;
+    }
+}
+
+/**
+ * Identifies the single upcoming track based on sequential or shuffle playback.
+ * Maintains one stable upcoming candidate for shuffle without re-randomizing while the current track plays.
+ */
+function getUpcomingTrack(currentIndex) {
+    if (playlist.length <= 1) return null;
+    if (loopMode === 'single') return null; // Avoid redundant pre-warming for single-track loop
+
+    if (isShuffle) {
+        // Reuse existing candidate if still valid
+        const isCandidateValid = nextShuffleCandidateIndex >= 0 &&
+            nextShuffleCandidateIndex < playlist.length &&
+            nextShuffleCandidateIndex !== currentIndex;
+
+        if (isCandidateValid) {
+            return playlist[nextShuffleCandidateIndex];
+        }
+
+        // Pick one stable random candidate different from currentIndex
+        const candidates = [];
+        for (let i = 0; i < playlist.length; i++) {
+            if (i !== currentIndex) candidates.push(i);
+        }
+        if (candidates.length === 0) return null;
+
+        nextShuffleCandidateIndex = candidates[Math.floor(Math.random() * candidates.length)];
+        return playlist[nextShuffleCandidateIndex];
+    }
+
+    // Sequential mode
+    if (currentIndex + 1 < playlist.length) {
+        return playlist[currentIndex + 1];
+    } else if (loopMode === 'playlist') {
+        return playlist[0]; // Wraparound in playlist loop
+    }
+    return null;
+}
+
+/**
+ * Pre-warms the single upcoming track via /api/warm.
+ * DOES NOT download audio, does not pipe audio to browser, and deduplicates in-flight requests.
+ * Protected by request ID token to prevent stale-request race conditions.
+ */
+function warmUpcomingTrack() {
+    const upcomingTrack = getUpcomingTrack(currentTrackIndex);
+    if (!upcomingTrack || !upcomingTrack.isStream) {
+        currentWarmRequestId++; // Invalidate any in-flight warm request
+        if (activeWarmController) {
+            activeWarmController.abort();
+            activeWarmController = null;
+        }
+        return;
+    }
+
+    const trackKey = upcomingTrack.videoId || extractYouTubeVideoId(upcomingTrack.url) || upcomingTrack.url;
+    pruneClientWarmCache();
+
+    const existing = warmCache.get(trackKey);
+    const now = Date.now();
+    if (existing && (existing.status === 'warmed' || existing.status === 'warming') && (now - existing.timestamp < CLIENT_WARM_TTL_MS)) {
+        return; // Already warmed or warming
+    }
+
+    // Cancel previous warm work for a different upcoming track
+    if (activeWarmController) {
+        activeWarmController.abort();
+        activeWarmController = null;
+    }
+
+    const thisRequestId = ++currentWarmRequestId;
+    const controller = new AbortController();
+    activeWarmController = controller;
+
+    const isStaleRequest = () =>
+        thisRequestId !== currentWarmRequestId || controller.signal.aborted;
+
+    warmCache.set(trackKey, { status: 'warming', timestamp: now });
+    pruneClientWarmCache();
+
+    console.log(`[Warm] Pre-warming lightweight metadata for (#${thisRequestId}): ${upcomingTrack.name || trackKey}`);
+
+    fetch(`/api/warm?url=${encodeURIComponent(upcomingTrack.url)}`, { signal: controller.signal })
+        .then(async (res) => {
+            if (isStaleRequest()) return;
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (isStaleRequest()) return;
+
+            warmCache.set(trackKey, { status: 'warmed', timestamp: Date.now(), data });
+            pruneClientWarmCache();
+
+            // Enrich upcoming track metadata if missing (only if still active)
+            if (isStaleRequest()) return;
+
+            if (data.metadata) {
+                if (!upcomingTrack.duration && data.metadata.duration) {
+                    upcomingTrack.duration = data.metadata.duration;
+                }
+                if (!upcomingTrack.thumbnail && data.metadata.thumbnail) {
+                    upcomingTrack.thumbnail = data.metadata.thumbnail;
+                }
+                if (!upcomingTrack.channel && data.metadata.channel) {
+                    upcomingTrack.channel = data.metadata.channel;
+                }
+                if ((!upcomingTrack.name || upcomingTrack.name === 'YouTube Audio') && data.metadata.title) {
+                    upcomingTrack.name = data.metadata.title;
+                    const items = playlistContainer ? playlistContainer.querySelectorAll('li') : [];
+                    const trackIdx = playlist.indexOf(upcomingTrack);
+                    if (trackIdx !== -1 && items[trackIdx]) {
+                        items[trackIdx].textContent = upcomingTrack.name;
+                    }
+                }
+            }
+        })
+        .catch((err) => {
+            if (isStaleRequest() || err?.name === 'AbortError') {
+                // Silently ignore stale or intentionally aborted requests.
+                // Do NOT mutate warmCache if a newer request replaced this one.
+                if (thisRequestId === currentWarmRequestId) {
+                    warmCache.delete(trackKey);
+                }
+                return;
+            }
+            console.log('[Warm] Lightweight pre-warming failed silently:', err.message);
+            if (thisRequestId === currentWarmRequestId) {
+                warmCache.set(trackKey, { status: 'failed', timestamp: Date.now() });
+                pruneClientWarmCache();
+            }
+        })
+        .finally(() => {
+            // Only clean up the controller if this exact request is still the active one
+            if (thisRequestId === currentWarmRequestId && activeWarmController === controller) {
+                activeWarmController = null;
+            }
+        });
+}
+
+// ─────────────────── Timeline & Playback State Manager ───────────────────
+let currentPlaybackSessionId = 0;
+let mediaSessionAbortController = null;
+let currentSessionNativeDuration = null;
+let isUserSeeking = false;
+let seekCommittedInCurrentGesture = false;
+
+function formatTime(seconds) {
+    const num = typeof seconds === 'number' ? seconds : parseFloat(seconds);
+    if (!Number.isFinite(num) || isNaN(num) || num <= 0) return '0:00';
+    const totalSecs = Math.floor(num + 1e-6);
+    const min = Math.floor(totalSecs / 60);
+    const sec = totalSecs % 60;
+    return `${min}:${sec < 10 ? '0' : ''}${sec}`;
+}
+
+/**
+ * Resolves the authoritative duration for the current playback session.
+ * Order of Authority:
+ * 1. Native duration from the active session's media resource (if finite and > 0)
+ * 2. Current track's metadata duration (if finite and > 0)
+ * 3. 0 (safe fallback)
+ */
+function getValidDuration(track) {
+    if (typeof currentSessionNativeDuration === 'number' && Number.isFinite(currentSessionNativeDuration) && currentSessionNativeDuration > 0) {
+        return currentSessionNativeDuration;
+    }
+    const candidateTrack = track || (playlist && playlist[currentTrackIndex]);
+    if (candidateTrack && typeof candidateTrack.duration === 'number' && Number.isFinite(candidateTrack.duration) && candidateTrack.duration > 0) {
+        return candidateTrack.duration;
+    }
+    return 0;
+}
+
+function updateProgressBarGradient(percent) {
+    const clamped = Math.min(100, Math.max(0, Number.isFinite(percent) ? percent : 0));
+    const themePrimary = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim() || '255, 75, 140';
+    progressBar.style.background = `linear-gradient(to right, rgba(${themePrimary}, 1) ${clamped}%, rgba(255, 255, 255, 0.1) ${clamped}%)`;
+}
+
+/**
+ * Centralized timeline state synchronizer.
+ * Respects isUserSeeking so automatic timeupdate events never fight user scrub preview.
+ */
+function syncPlaybackTimeline(callingSessionId) {
+    if (callingSessionId !== undefined && callingSessionId !== currentPlaybackSessionId) {
+        return;
+    }
+    const currentTrack = playlist[currentTrackIndex];
+    const duration = getValidDuration(currentTrack);
+
+    // Update total time display as soon as duration is known
+    totalTimeEl.textContent = duration > 0 ? formatTime(duration) : '0:00';
+
+    // If user is actively dragging the slider, protect their preview from timeupdate overwrite
+    if (isUserSeeking) return;
+
+    const curTime = (Number.isFinite(audioSource.currentTime) && audioSource.currentTime >= 0)
+        ? (duration > 0 ? Math.min(duration, audioSource.currentTime) : audioSource.currentTime)
+        : 0;
+
+    currentTimeEl.textContent = formatTime(curTime);
+
+    let progressPercent = 0;
+    if (duration > 0) {
+        progressPercent = Math.min(100, Math.max(0, (curTime / duration) * 100));
+    }
+    progressBar.value = progressPercent;
+    updateProgressBarGradient(progressPercent);
+}
+
+/**
+ * Scrub preview handler: updates visual slider and currentTimeEl preview without seeking audio.
+ */
+function onSeekInput() {
+    isUserSeeking = true;
+    seekCommittedInCurrentGesture = false;
+    const currentTrack = playlist[currentTrackIndex];
+    const duration = getValidDuration(currentTrack);
+
+    const percent = parseFloat(progressBar.value);
+    if (!Number.isFinite(percent)) return;
+    const clampedPercent = Math.min(100, Math.max(0, percent));
+
+    updateProgressBarGradient(clampedPercent);
+
+    if (duration > 0) {
+        const previewTime = (clampedPercent / 100) * duration;
+        currentTimeEl.textContent = formatTime(previewTime);
+    } else {
+        currentTimeEl.textContent = '0:00';
+    }
+}
+
+/**
+ * Idempotent seek committer. Validates and clamps seek target, then assigns audioSource.currentTime.
+ * Prevents duplicate commits when both pointerup and change fire.
+ */
+function commitSeek(fromKeyboard = false) {
+    if (!isUserSeeking && !fromKeyboard) return;
+    if (seekCommittedInCurrentGesture) return;
+
+    seekCommittedInCurrentGesture = true;
+    isUserSeeking = false;
+
+    const currentTrack = playlist[currentTrackIndex];
+    const duration = getValidDuration(currentTrack);
+    const percent = parseFloat(progressBar.value);
+
+    if (duration > 0 && Number.isFinite(percent)) {
+        const clampedPercent = Math.min(100, Math.max(0, percent));
+        const targetTime = Math.min(duration, Math.max(0, (clampedPercent / 100) * duration));
+
+        if (Number.isFinite(targetTime) && targetTime >= 0 && targetTime <= duration && duration > 0) {
+            try {
+                audioSource.currentTime = targetTime;
+            } catch (err) {
+                console.warn('[AudioPlayer] Seek failed safely:', err);
+            }
+        }
+    }
+
+    syncPlaybackTimeline(currentPlaybackSessionId);
+
+    setTimeout(() => {
+        seekCommittedInCurrentGesture = false;
+    }, 100);
+}
+
+function cancelSeek() {
+    if (!isUserSeeking) return;
+    isUserSeeking = false;
+    seekCommittedInCurrentGesture = false;
+    syncPlaybackTimeline(currentPlaybackSessionId);
+}
+
+// Progress slider seeking listeners
+const onSeekStart = () => {
+    isUserSeeking = true;
+    seekCommittedInCurrentGesture = false;
+};
+progressBar.addEventListener('pointerdown', onSeekStart);
+progressBar.addEventListener('touchstart', onSeekStart, { passive: true });
+progressBar.addEventListener('mousedown', onSeekStart);
+
+progressBar.addEventListener('input', onSeekInput);
+
+progressBar.addEventListener('pointerup', () => commitSeek(false));
+progressBar.addEventListener('touchend', () => commitSeek(false));
+progressBar.addEventListener('mouseup', () => commitSeek(false));
+
+progressBar.addEventListener('pointercancel', () => cancelSeek());
+progressBar.addEventListener('touchcancel', () => cancelSeek());
+
+// Handle keyboard slider interaction (e.g. arrow keys) & prevent duplicate commits with pointerup
+progressBar.addEventListener('change', () => {
+    if (seekCommittedInCurrentGesture) {
+        seekCommittedInCurrentGesture = false;
+        return;
+    }
+    commitSeek(true);
+});
+
+progressBar.addEventListener('keyup', (e) => {
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(e.key)) {
+        commitSeek(true);
+    }
+});
+
+/**
+ * Binds per-load media session listeners with AbortController signal and media load token.
+ * Ensures events from previous tracks cannot mutate the current track's UI.
+ */
+function setupMediaSessionListeners(sessionId, signal, track, mediaLoadToken) {
+    const isStale = () => {
+        if (sessionId !== currentPlaybackSessionId) return true;
+        if (signal.aborted) return true;
+        if (audioSource.dataset && audioSource.dataset.mediaLoadToken !== mediaLoadToken) return true;
+        if (track && playlist && playlist[currentTrackIndex] !== track) return true;
+        return false;
+    };
+
+    const onMetadataLoaded = () => {
+        if (isStale()) return;
+        if (Number.isFinite(audioSource.duration) && audioSource.duration > 0) {
+            currentSessionNativeDuration = audioSource.duration;
+            if (track && (!track.duration || track.duration <= 0)) {
+                track.duration = audioSource.duration;
+            }
+        }
+        syncPlaybackTimeline(sessionId);
+    };
+
+    const onDurationChanged = () => {
+        if (isStale()) return;
+        if (Number.isFinite(audioSource.duration) && audioSource.duration > 0) {
+            currentSessionNativeDuration = audioSource.duration;
+            if (track && (!track.duration || track.duration <= 0)) {
+                track.duration = audioSource.duration;
+            }
+        }
+        syncPlaybackTimeline(sessionId);
+    };
+
+    const onTimeUpdated = () => {
+        if (isStale()) return;
+        syncPlaybackTimeline(sessionId);
+    };
+
+    const onEnded = () => {
+        if (isStale()) return;
+        if (playlist.length > 0 && loopMode !== 'single') {
+            playNextTrack();
+        } else if (loopMode === 'single') {
+            audioSource.currentTime = 0;
+            playAudio();
+        }
+    };
+
+    audioSource.addEventListener('loadedmetadata', onMetadataLoaded, { signal });
+    audioSource.addEventListener('durationchange', onDurationChanged, { signal });
+    audioSource.addEventListener('timeupdate', onTimeUpdated, { signal });
+    audioSource.addEventListener('ended', onEnded, { signal });
 }
 
 function loadTrack(index) {
     if (playlist.length === 0) return;
+    
+    // 1. Advance playback session ID and abort prior session's media event listeners
+    const thisSessionId = ++currentPlaybackSessionId;
+    if (mediaSessionAbortController) {
+        mediaSessionAbortController.abort();
+        mediaSessionAbortController = null;
+    }
+    mediaSessionAbortController = new AbortController();
+    const { signal } = mediaSessionAbortController;
+
+    // Explicit media-load token to distinguish active resource on the reused audio element
+    const mediaLoadToken = `session_${thisSessionId}_${Date.now()}`;
+    if (!audioSource.dataset) audioSource.dataset = {};
+    audioSource.dataset.mediaLoadToken = mediaLoadToken;
+
+    // 2. Invalidate previous native duration and cancel any active seek gesture
+    currentSessionNativeDuration = null;
+    isUserSeeking = false;
     
     // Revoke previous object URL to prevent memory leaks if playing continuously
     if (audioSource.src && audioSource.src.startsWith('blob:')) {
@@ -1148,21 +1557,24 @@ function loadTrack(index) {
     pauseAudio();
     
     const file = playlist[index];
+    currentTrackIndex = index;
     let fileURL;
     
     if (file.isStream) {
-        // Stream from the local backend proxy
+        // If warm metadata exists, bind it immediately
+        const trackKey = file.videoId || extractYouTubeVideoId(file.url) || file.url;
+        const warmEntry = warmCache.get(trackKey);
+        if (warmEntry && warmEntry.status === 'warmed' && warmEntry.data?.metadata) {
+            const meta = warmEntry.data.metadata;
+            if (!file.duration && meta.duration) file.duration = meta.duration;
+            if (!file.thumbnail && meta.thumbnail) file.thumbnail = meta.thumbnail;
+            if (!file.channel && meta.channel) file.channel = meta.channel;
+            if ((!file.name || file.name === 'YouTube Audio') && meta.title) file.name = meta.title;
+        }
+
+        // Stream from the local backend proxy (strictly when playing/selecting track)
         fileURL = `/api/stream?url=${encodeURIComponent(file.url)}`;
         trackNameLabel.textContent = file.name || 'YouTube Audio';
-        
-        // Immediate timeline binding from metadata duration if available
-        if (file.duration && isFinite(file.duration) && file.duration > 0) {
-            totalTimeEl.textContent = formatTime(file.duration);
-        } else {
-            totalTimeEl.textContent = '0:00';
-        }
-        currentTimeEl.textContent = '0:00';
-        progressBar.value = 0;
         
         // Clear hover waveform canvas since we cannot easily pre-render a remote stream
         const hoverCanvas = document.getElementById('waveform-hover-canvas');
@@ -1177,11 +1589,26 @@ function loadTrack(index) {
         // Generate hover waveform overlay
         generateHoverWaveform(fileURL);
     }
+
+    // 3. Immediately reset timeline UI for both streams AND local files
+    currentTimeEl.textContent = '0:00';
+    progressBar.value = 0;
+    updateProgressBarGradient(0);
+
+    const initialDuration = getValidDuration(file);
+    totalTimeEl.textContent = initialDuration > 0 ? formatTime(initialDuration) : '0:00';
+
+    try {
+        audioSource.currentTime = 0;
+    } catch (e) {}
+
+    // 4. Setup per-load media session listeners with session token
+    setupMediaSessionListeners(thisSessionId, signal, file, mediaLoadToken);
     
     audioSource.src = fileURL;
     
     // Highlight Active Track in Playlist
-    const items = playlistContainer.querySelectorAll('li');
+    const items = playlistContainer ? playlistContainer.querySelectorAll('li') : [];
     items.forEach(item => item.classList.remove('active-track'));
     if (items[index]) {
         items[index].classList.add('active-track');
@@ -1191,7 +1618,7 @@ function loadTrack(index) {
     const titleContainer = document.querySelector('.track-title-container');
     trackNameLabel.classList.remove('is-scrolling');
     setTimeout(() => {
-        if (trackNameLabel.scrollWidth > titleContainer.clientWidth) {
+        if (titleContainer && trackNameLabel.scrollWidth > titleContainer.clientWidth) {
             trackNameLabel.classList.add('is-scrolling');
         }
     }, 50);
@@ -1205,21 +1632,13 @@ function loadTrack(index) {
     
     playAudio();
 
-    // --- Smart Pre-loading ---
-    // If the next track is a stream, silently ping the backend to spin up yt-dlp early
-    if (!isShuffle && index + 1 < playlist.length) {
-        const nextFile = playlist[index + 1];
-        if (nextFile.isStream) {
-            preloadNextTrack(nextFile.url);
-        }
-    } else if (isShuffle && playlist.length > 1) {
-        // Preload a random track to anticipate shuffle
-        const randomNext = (index + 1) % playlist.length; // Simplified guess
-        const nextFile = playlist[randomNext];
-        if (nextFile && nextFile.isStream) {
-            preloadNextTrack(nextFile.url);
-        }
+    // Reset shuffle candidate if we advanced to it
+    if (nextShuffleCandidateIndex === index) {
+        nextShuffleCandidateIndex = -1;
     }
+
+    // --- Lightweight Pre-warming for Upcoming Track ---
+    warmUpcomingTrack();
 }
 
 btnPrev.addEventListener('click', () => {
@@ -1233,11 +1652,23 @@ function playNextTrack() {
     if (playlist.length === 0) return;
     
     if (isShuffle && playlist.length > 1) {
-        let newIndex = currentTrackIndex;
-        while (newIndex === currentTrackIndex) {
-            newIndex = Math.floor(Math.random() * playlist.length);
+        // Advance to the pre-warmed shuffle candidate if valid
+        const isCandidateValid = nextShuffleCandidateIndex >= 0 &&
+            nextShuffleCandidateIndex < playlist.length &&
+            nextShuffleCandidateIndex !== currentTrackIndex;
+
+        let nextIndex;
+        if (isCandidateValid) {
+            nextIndex = nextShuffleCandidateIndex;
+        } else {
+            let rand = currentTrackIndex;
+            while (rand === currentTrackIndex) {
+                rand = Math.floor(Math.random() * playlist.length);
+            }
+            nextIndex = rand;
         }
-        currentTrackIndex = newIndex;
+        nextShuffleCandidateIndex = -1; // Reset candidate
+        currentTrackIndex = nextIndex;
         loadTrack(currentTrackIndex);
     } else {
         currentTrackIndex++;
@@ -1259,13 +1690,6 @@ function playNextTrack() {
 btnNext.addEventListener('click', () => {
     playNextTrack();
 });
-
-audioSource.addEventListener('ended', () => {
-    if (playlist.length > 0 && loopMode !== 'single') {
-        playNextTrack();
-    }
-});
-
 // Sync UI with native audio events (fixes keyboard media keys desync)
 audioSource.addEventListener('play', () => {
     isPlaying = true;
@@ -1277,68 +1701,6 @@ audioSource.addEventListener('pause', () => {
     isPlaying = false;
     iconPause.classList.add('hidden');
     iconPlay.classList.remove('hidden');
-});
-
-// --- Timeline Logic ---
-function formatTime(seconds) {
-    if (isNaN(seconds) || !isFinite(seconds) || seconds < 0) return '0:00';
-    const min = Math.floor(seconds / 60);
-    const sec = Math.floor(seconds % 60);
-    return `${min}:${sec < 10 ? '0' : ''}${sec}`;
-}
-
-audioSource.addEventListener('timeupdate', () => {
-    const currentTrack = playlist[currentTrackIndex];
-    // For local files, native duration is finite and valid.
-    // For remote streams with chunked/live headers, fallback to metadata duration when native duration is invalid.
-    const isNativeValid = isFinite(audioSource.duration) && audioSource.duration > 0;
-    const duration = isNativeValid
-        ? audioSource.duration
-        : (currentTrack && currentTrack.duration && isFinite(currentTrack.duration) ? currentTrack.duration : 0);
-
-    if (duration <= 0) return;
-    
-    const curTime = (isFinite(audioSource.currentTime) && audioSource.currentTime >= 0) ? audioSource.currentTime : 0;
-    const progressPercent = Math.min(100, Math.max(0, (curTime / duration) * 100));
-    progressBar.value = progressPercent;
-    
-    const themePrimary = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim();
-    progressBar.style.background = `linear-gradient(to right, rgba(${themePrimary}, 1) ${progressPercent}%, rgba(255, 255, 255, 0.1) ${progressPercent}%)`;
-    
-    currentTimeEl.textContent = formatTime(curTime);
-    totalTimeEl.textContent = formatTime(duration);
-});
-
-progressBar.addEventListener('input', () => {
-    const currentTrack = playlist[currentTrackIndex];
-    const isNativeValid = isFinite(audioSource.duration) && audioSource.duration > 0;
-    const duration = isNativeValid
-        ? audioSource.duration
-        : (currentTrack && currentTrack.duration && isFinite(currentTrack.duration) ? currentTrack.duration : 0);
-
-    if (!duration || !isFinite(duration) || duration <= 0) return;
-
-    const percent = parseFloat(progressBar.value);
-    if (isNaN(percent) || !isFinite(percent)) return;
-
-    const seekTime = (percent / 100) * duration;
-    if (isFinite(seekTime) && seekTime >= 0) {
-        try {
-            audioSource.currentTime = seekTime;
-        } catch (seekErr) {
-            console.warn('[AudioPlayer] Defensive seek failed safely:', seekErr);
-        }
-    }
-});
-
-// Update duration when native metadata is loaded if finite
-audioSource.addEventListener('loadedmetadata', () => {
-    const currentTrack = playlist[currentTrackIndex];
-    if (isFinite(audioSource.duration) && audioSource.duration > 0) {
-        totalTimeEl.textContent = formatTime(audioSource.duration);
-    } else if (currentTrack && currentTrack.duration > 0) {
-        totalTimeEl.textContent = formatTime(currentTrack.duration);
-    }
 });
 
 // 3. Play/Pause
@@ -1417,7 +1779,9 @@ function updatePlaybackUI() {
 
 btnShuffle.addEventListener('click', () => {
     isShuffle = !isShuffle;
+    nextShuffleCandidateIndex = -1;
     updatePlaybackUI();
+    warmUpcomingTrack();
 });
 
 btnLoopToggle.addEventListener('click', () => {
@@ -1427,6 +1791,7 @@ btnLoopToggle.addEventListener('click', () => {
     
     updatePlaybackUI();
     audioSource.loop = (loopMode === 'single');
+    warmUpcomingTrack();
 });
 
 // 5. Mode Selection
