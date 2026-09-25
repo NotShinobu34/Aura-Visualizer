@@ -65,10 +65,27 @@ const btnLoadPlaylist = document.getElementById('btn-load-playlist');
 const loadingPopup = document.getElementById('loading-popup');
 const loadingPopupText = document.getElementById('loading-popup-text');
 
-// --- Dynamic Theme Logic ---
+// --- Dynamic Theme Logic & Color Caching ---
 let activeThemeHour = -1;
 let activeThemeColor = '#ffffff';
 let activeThemeGlow = '#ffffff';
+let cachedThemePrimary = '255, 75, 140';
+let cachedThemeGlow = '255, 130, 180';
+let cachedThemeSecondary = '0, 240, 255';
+let cachedThemePrimaryRgb = 'rgb(255, 75, 140)';
+let cachedThemeGlowRgb = 'rgb(255, 130, 180)';
+
+function updateCachedThemeColors() {
+    if (typeof window === 'undefined' || !document.documentElement) return;
+    const computedStyle = getComputedStyle(document.documentElement);
+    cachedThemePrimary = computedStyle.getPropertyValue('--theme-primary').trim() || '255, 75, 140';
+    cachedThemeGlow = computedStyle.getPropertyValue('--theme-glow').trim() || '255, 130, 180';
+    cachedThemeSecondary = computedStyle.getPropertyValue('--theme-secondary').trim() || '0, 240, 255';
+    cachedThemePrimaryRgb = `rgb(${cachedThemePrimary})`;
+    cachedThemeGlowRgb = `rgb(${cachedThemeGlow})`;
+    activeThemeColor = cachedThemePrimaryRgb;
+    activeThemeGlow = cachedThemeGlowRgb;
+}
 
 function setDynamicTheme(hour) {
     if (document.getElementById('color-override-toggle') && document.getElementById('color-override-toggle').checked) return;
@@ -118,9 +135,7 @@ function setDynamicTheme(hour) {
     document.documentElement.style.setProperty('--theme-secondary', secondary);
     document.documentElement.style.setProperty('--theme-glow', glow);
     
-    const computedStyle = getComputedStyle(document.documentElement);
-    activeThemeColor = `rgb(${computedStyle.getPropertyValue('--theme-primary').trim()})`;
-    activeThemeGlow = `rgb(${computedStyle.getPropertyValue('--theme-glow').trim()})`;
+    updateCachedThemeColors();
 }
 
 function startThemeMonitor() {
@@ -131,6 +146,7 @@ function startThemeMonitor() {
 }
 
 setDynamicTheme(new Date().getHours());
+updateCachedThemeColors();
 startThemeMonitor();
 
 // Sidebar Elements
@@ -198,20 +214,34 @@ let isShuffle = false;
 let eqFilters = [];
 
 // Safe Window Dimensions
-let w = window.innerWidth;
-let h = window.innerHeight;
+let w = typeof window !== 'undefined' ? window.innerWidth : 1280;
+let h = typeof window !== 'undefined' ? window.innerHeight : 720;
+let currentDpr = 1;
 
 // --- Initialize Canvas ---
 function resizeCanvas() {
-    w = window.innerWidth;
-    h = window.innerHeight;
-    const dpr = window.devicePixelRatio || 1;
+    if (typeof window === 'undefined' || !canvas || !ctx) return;
+    const newW = window.innerWidth;
+    const newH = window.innerHeight;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
     
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
+    const targetWidth = Math.floor(newW * dpr);
+    const targetHeight = Math.floor(newH * dpr);
     
-    // Normalize coordinate system to use CSS pixels
-    ctx.scale(dpr, dpr);
+    // Avoid redundant allocations and canvas clearing if dimensions haven't changed
+    if (canvas.width === targetWidth && canvas.height === targetHeight && w === newW && h === newH && currentDpr === dpr) {
+        return;
+    }
+    
+    w = newW;
+    h = newH;
+    currentDpr = dpr;
+    
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    
+    // Reset transform completely and apply DPR scaling exactly once to prevent cumulative scaling
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
 window.addEventListener('resize', resizeCanvas);
@@ -266,10 +296,8 @@ btnLaunch.addEventListener('click', () => {
     topNavControls.classList.remove('hidden');
     topRightControls.classList.remove('hidden');
     
-    // Start animation loop
-    if (!animationId) {
-        requestAnimationFrame(renderLoop);
-    }
+    // Start animation loop cleanly
+    startVisualizerLoop();
 });
 
 // 2. Upload Modal Logic
@@ -658,7 +686,7 @@ async function loadSingleYouTubeTrack(rawUrl) {
         currentTimeEl.textContent = '0:00';
         totalTimeEl.textContent = formatTime(newTrack.duration);
         progressBar.value = 0;
-        const themePrimary = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim();
+        const themePrimary = cachedThemePrimary || '255, 75, 140';
         progressBar.style.background = `linear-gradient(to right, rgba(${themePrimary}, 1) 0%, rgba(255, 255, 255, 0.1) 0%)`;
 
         // Smart marquee check for title overflow
@@ -1339,7 +1367,7 @@ function getValidDuration(track) {
 
 function updateProgressBarGradient(percent) {
     const clamped = Math.min(100, Math.max(0, Number.isFinite(percent) ? percent : 0));
-    const themePrimary = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim() || '255, 75, 140';
+    const themePrimary = cachedThemePrimary || '255, 75, 140';
     progressBar.style.background = `linear-gradient(to right, rgba(${themePrimary}, 1) ${clamped}%, rgba(255, 255, 255, 0.1) ${clamped}%)`;
 }
 
@@ -1749,8 +1777,8 @@ function pauseAudio() {
 
 // 4. Playback Mode Logic (Shuffle/Loop)
 function updatePlaybackUI() {
-    const primary = `rgba(${getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim()}, 1)`;
-    const glow = `drop-shadow(0 0 8px rgba(${getComputedStyle(document.documentElement).getPropertyValue('--theme-glow').trim()}, 0.6))`;
+    const primary = cachedThemePrimaryRgb || 'rgb(255, 75, 140)';
+    const glow = `drop-shadow(0 0 8px rgba(${cachedThemeGlow}, 0.6))`;
 
     if (isShuffle) {
         btnShuffle.style.color = primary;
@@ -2003,26 +2031,55 @@ function getAverageFrequency(start, end) {
     return sum / (safeEnd - start);
 }
 
-function getRenderColorParams(currentMode, elementIndex, totalElements, timeElapsed) {
+// Reusable color params object to prevent hundreds of allocations per frame
+const sharedColorParams = { isSpectrum: false, hue: 0, rgb: '' };
+let isColorOverrideOn = false;
+
+function initColorOverrideCache() {
+    if (typeof document === 'undefined') return;
     const overrideToggle = document.getElementById('color-override-toggle');
-    const isOverrideOn = overrideToggle ? overrideToggle.checked : false;
-    const themeColor = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim();
-    
-    const multiColorModes = ['mandala', 'swarm', 'neonbars'];
-    
-    if (!isOverrideOn && multiColorModes.includes(currentMode)) {
-        const hue = ((elementIndex / totalElements) * 360 + (timeElapsed * 50)) % 360;
-        return { isSpectrum: true, hue: hue, rgb: themeColor };
-    } else {
-        return { isSpectrum: false, rgb: themeColor };
+    if (overrideToggle) {
+        isColorOverrideOn = overrideToggle.checked;
+        overrideToggle.addEventListener('change', () => {
+            isColorOverrideOn = overrideToggle.checked;
+        });
     }
+}
+if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initColorOverrideCache);
+    } else {
+        initColorOverrideCache();
+    }
+}
+
+function getRenderColorParams(currentMode, elementIndex, totalElements, timeElapsed) {
+    if (!isColorOverrideOn && (currentMode === 'mandala' || currentMode === 'swarm' || currentMode === 'neonbars')) {
+        sharedColorParams.isSpectrum = true;
+        sharedColorParams.hue = ((elementIndex / totalElements) * 360 + (timeElapsed * 50)) % 360;
+        sharedColorParams.rgb = cachedThemePrimary;
+    } else {
+        sharedColorParams.isSpectrum = false;
+        sharedColorParams.hue = 0;
+        sharedColorParams.rgb = cachedThemePrimary;
+    }
+    return sharedColorParams;
+}
+
+// Precomputed trigonometric lookup table for Mandala (64 spokes)
+const MANDALA_SPOKES = 64;
+const MANDALA_COS = new Float32Array(MANDALA_SPOKES);
+const MANDALA_SIN = new Float32Array(MANDALA_SPOKES);
+for (let i = 0; i < MANDALA_SPOKES; i++) {
+    const angle = (i * (Math.PI * 2)) / MANDALA_SPOKES;
+    MANDALA_COS[i] = Math.cos(angle);
+    MANDALA_SIN[i] = Math.sin(angle);
 }
 
 // Draw Mandala Mode
 function drawMandala(bassAvg) {
     const cx = w / 2;
     const cy = h / 2;
-    const numSpokes = 64;
     
     // Bass scales the base radius
     const baseRadius = Math.min(w, h) * 0.15 + (bassAvg * sensitivity * 0.5);
@@ -2031,25 +2088,27 @@ function drawMandala(bassAvg) {
     ctx.lineCap = 'round';
     
     const timeElapsed = performance.now() / 1000;
+    const binCount = analyser ? analyser.frequencyBinCount : 256;
 
-    for (let i = 0; i < numSpokes; i++) {
-        const angle = (i * (Math.PI * 2)) / numSpokes;
+    for (let i = 0; i < MANDALA_SPOKES; i++) {
+        const cosA = MANDALA_COS[i];
+        const sinA = MANDALA_SIN[i];
         
         // Map spoke to frequency bin safely (0 to 255)
-        const binIndex = Math.min(Math.floor((i / numSpokes) * analyser.frequencyBinCount), analyser.frequencyBinCount - 1);
+        const binIndex = Math.min(Math.floor((i / MANDALA_SPOKES) * binCount), binCount - 1);
         const freqVal = dataArray ? dataArray[binIndex] : 0;
         
         // Mid-to-high drives length
         const extrusion = freqVal * sensitivity * 1.2;
         const finalRadius = baseRadius + extrusion;
         
-        const x1 = cx + Math.cos(angle) * baseRadius;
-        const y1 = cy + Math.sin(angle) * baseRadius;
-        const x2 = cx + Math.cos(angle) * finalRadius;
-        const y2 = cy + Math.sin(angle) * finalRadius;
+        const x1 = cx + cosA * baseRadius;
+        const y1 = cy + sinA * baseRadius;
+        const x2 = cx + cosA * finalRadius;
+        const y2 = cy + sinA * finalRadius;
         
         const alpha = 0.4 + (freqVal / 255) * 0.6;
-        const cParams = getRenderColorParams('mandala', i, numSpokes, timeElapsed);
+        const cParams = getRenderColorParams('mandala', i, MANDALA_SPOKES, timeElapsed);
         
         if (cParams.isSpectrum) {
             ctx.strokeStyle = `hsla(${cParams.hue}, 100%, 60%, ${alpha})`;
@@ -2066,7 +2125,7 @@ function drawMandala(bassAvg) {
     // Draw central connecting ring
     ctx.beginPath();
     ctx.arc(cx, cy, baseRadius, 0, Math.PI * 2);
-    const ringAlpha = 0.2 + (bassAvg/255)*0.5;
+    const ringAlpha = 0.2 + (bassAvg / 255) * 0.5;
     const ringCParams = getRenderColorParams('mandala', 0, 1, timeElapsed);
     if (ringCParams.isSpectrum) {
         ctx.strokeStyle = `hsla(${(timeElapsed * 50) % 360}, 100%, 60%, ${ringAlpha})`;
@@ -2128,19 +2187,58 @@ function drawSwarm(bassAvg, highAvg) {
     }
 }
 
-// Main 60 FPS Render Loop
-function renderLoop() {
-    animationId = requestAnimationFrame(renderLoop);
+// --- Single Visualizer Animation Loop Lifecycle ---
+let visualizerAnimationId = null;
+let isVisualizerLoopRunning = false;
+let isCanvasVisible = true;
 
+function startVisualizerLoop() {
+    if (isVisualizerLoopRunning) return;
+    if (!isCanvasVisible || (typeof document !== 'undefined' && document.hidden)) return;
+    
+    isVisualizerLoopRunning = true;
+
+    function loop() {
+        if (!isVisualizerLoopRunning) {
+            visualizerAnimationId = null;
+            animationId = null;
+            return;
+        }
+        renderLoop();
+        visualizerAnimationId = requestAnimationFrame(loop);
+        animationId = visualizerAnimationId;
+    }
+
+    visualizerAnimationId = requestAnimationFrame(loop);
+    animationId = visualizerAnimationId;
+}
+
+function stopVisualizerLoop() {
+    isVisualizerLoopRunning = false;
+    if (visualizerAnimationId) {
+        cancelAnimationFrame(visualizerAnimationId);
+        visualizerAnimationId = null;
+    }
+    animationId = null;
+}
+
+// Page Visibility API: Stop rendering when tab is hidden, resume when visible
+if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            stopVisualizerLoop();
+        } else {
+            if (isCanvasVisible && heroScreen && heroScreen.classList.contains('fade-out')) {
+                startVisualizerLoop();
+            }
+        }
+    });
+}
+
+// Main 60 FPS Render Loop (Driven exclusively by startVisualizerLoop)
+function renderLoop() {
     // CRITICAL GUARD CLAUSE: Do not attempt to process audio data if the analyser isn't ready
     if (!analyser || typeof analyser.frequencyBinCount === 'undefined') return;
-
-    // Update activeThemeColor and activeThemeGlow from CSS variables dynamically
-    const computedStyle = getComputedStyle(document.documentElement);
-    const themePrimary = computedStyle.getPropertyValue('--theme-primary').trim();
-    const themeGlow = computedStyle.getPropertyValue('--theme-glow').trim();
-    activeThemeColor = `rgb(${themePrimary})`;
-    activeThemeGlow = `rgb(${themeGlow})`;
 
     // 1. Reset composite operation to default so clearing works
     ctx.globalCompositeOperation = 'source-over'; 
@@ -2164,10 +2262,10 @@ function renderLoop() {
         analyser.getByteTimeDomainData(timeDataArray);
     } else if (analyser) {
         // Slowly drop to zero if paused
-        for(let i=0; i<dataArray.length; i++) {
+        for (let i = 0; i < dataArray.length; i++) {
             dataArray[i] = Math.max(0, dataArray[i] - 5);
         }
-        for(let i=0; i<timeDataArray.length; i++) {
+        for (let i = 0; i < timeDataArray.length; i++) {
             // time domain rests at 128
             timeDataArray[i] = timeDataArray[i] > 128 ? Math.max(128, timeDataArray[i] - 5) : Math.min(128, timeDataArray[i] + 5);
         }
@@ -2214,15 +2312,12 @@ function renderLoop() {
 
 // Oscilloscope Mode
 function drawOscilloscope() {
-    const themePrimary = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim();
-    const themeGlow = getComputedStyle(document.documentElement).getPropertyValue('--theme-glow').trim();
-    
     ctx.lineWidth = 3;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-    ctx.strokeStyle = `rgba(${themePrimary}, 0.9)`;
+    ctx.strokeStyle = `rgba(${cachedThemePrimary}, 0.9)`;
     ctx.shadowBlur = 10;
-    ctx.shadowColor = `rgba(${themeGlow}, 0.8)`;
+    ctx.shadowColor = `rgba(${cachedThemeGlow}, 0.8)`;
     
     ctx.beginPath();
     
@@ -2264,9 +2359,8 @@ function drawNeonBars() {
             ctx.fillStyle = `hsla(${cParams.hue}, 100%, 60%, ${alpha})`;
             ctx.shadowColor = `hsla(${cParams.hue}, 100%, 60%, 0.8)`;
         } else {
-            const themeGlow = getComputedStyle(document.documentElement).getPropertyValue('--theme-glow').trim();
             ctx.fillStyle = `rgba(${cParams.rgb}, ${alpha})`;
-            ctx.shadowColor = `rgba(${themeGlow}, 0.8)`;
+            ctx.shadowColor = `rgba(${cachedThemeGlow}, 0.8)`;
         }
         
         // Draw from bottom up
@@ -2332,7 +2426,7 @@ function drawSynthwaveGrid(bassAvg) {
     ctx.save();
 
     // Draw perspective lines (radiating from vanishing point)
-    ctx.strokeStyle = `rgba(${getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim()}, 0.25)`;
+    ctx.strokeStyle = `rgba(${cachedThemePrimary}, 0.25)`;
     ctx.lineWidth = 1;
     ctx.beginPath();
     for (let i = 0; i < perspectiveLines; i++) {
@@ -2359,7 +2453,7 @@ function drawSynthwaveGrid(bassAvg) {
         const distortion = audioVal * 30 * sensitivity;
 
         const alpha = Math.min(1, 0.2 + t * 0.8);
-        ctx.strokeStyle = `rgba(${getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim()}, ${alpha})`;
+        ctx.strokeStyle = `rgba(${cachedThemePrimary}, ${alpha})`;
 
         ctx.beginPath();
         const segments = 40;
@@ -2387,8 +2481,8 @@ function drawSynthwaveGrid(bassAvg) {
     // Sun circle at horizon
     const sunRadius = 40 + bassAvg * 0.5;
     const sunGrad = ctx.createRadialGradient(vanishX, horizonY, 0, vanishX, horizonY, sunRadius);
-    sunGrad.addColorStop(0, `rgba(${getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim()}, 0.8)`);
-    sunGrad.addColorStop(0.5, `rgba(${getComputedStyle(document.documentElement).getPropertyValue('--theme-glow').trim()}, 0.3)`);
+    sunGrad.addColorStop(0, `rgba(${cachedThemePrimary}, 0.8)`);
+    sunGrad.addColorStop(0.5, `rgba(${cachedThemeGlow}, 0.3)`);
     sunGrad.addColorStop(1, 'transparent');
     ctx.fillStyle = sunGrad;
     ctx.beginPath();
@@ -2405,6 +2499,7 @@ function drawSynthwaveGrid(bassAvg) {
 let plexusNodes = [];
 const PLEXUS_COUNT = 90;
 const PLEXUS_CONNECT_DIST = 150;
+const PLEXUS_CONNECT_DIST_SQ = PLEXUS_CONNECT_DIST * PLEXUS_CONNECT_DIST;
 
 function initPlexusNodes() {
     plexusNodes = [];
@@ -2420,9 +2515,6 @@ function initPlexusNodes() {
 }
 
 function drawAudioPlexus(bassAvg) {
-    const primaryRGB = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim();
-    const glowRGB = getComputedStyle(document.documentElement).getPropertyValue('--theme-glow').trim();
-
     // Overall audio energy
     let totalEnergy = 0;
     const sampleSize = dataArray ? Math.min(dataArray.length, 128) : 0;
@@ -2446,19 +2538,22 @@ function drawAudioPlexus(bassAvg) {
         p.y = Math.max(0, Math.min(h, p.y));
     }
 
-    // Draw connections
+    // Draw connections - optimized squared distance test before Math.sqrt
     const lineAlpha = 0.05 + avgEnergy * 0.45;
     for (let i = 0; i < plexusNodes.length; i++) {
+        const pi = plexusNodes[i];
         for (let j = i + 1; j < plexusNodes.length; j++) {
-            const dx = plexusNodes[i].x - plexusNodes[j].x;
-            const dy = plexusNodes[i].y - plexusNodes[j].y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist < PLEXUS_CONNECT_DIST) {
+            const pj = plexusNodes[j];
+            const dx = pi.x - pj.x;
+            const dy = pi.y - pj.y;
+            const distSq = dx * dx + dy * dy;
+            if (distSq < PLEXUS_CONNECT_DIST_SQ) {
+                const dist = Math.sqrt(distSq);
                 const proximity = 1 - dist / PLEXUS_CONNECT_DIST;
                 ctx.beginPath();
-                ctx.moveTo(plexusNodes[i].x, plexusNodes[i].y);
-                ctx.lineTo(plexusNodes[j].x, plexusNodes[j].y);
-                ctx.strokeStyle = `rgba(${primaryRGB}, ${proximity * lineAlpha})`;
+                ctx.moveTo(pi.x, pi.y);
+                ctx.lineTo(pj.x, pj.y);
+                ctx.strokeStyle = `rgba(${cachedThemePrimary}, ${proximity * lineAlpha})`;
                 ctx.lineWidth = proximity * 1.5;
                 ctx.stroke();
             }
@@ -2467,13 +2562,13 @@ function drawAudioPlexus(bassAvg) {
 
     // Draw nodes
     ctx.shadowBlur = 12;
-    ctx.shadowColor = `rgba(${glowRGB}, 0.8)`;
+    ctx.shadowColor = `rgba(${cachedThemeGlow}, 0.8)`;
+    const nodeAlpha = 0.4 + avgEnergy * 0.6;
+    ctx.fillStyle = `rgba(${cachedThemePrimary}, ${nodeAlpha})`;
     for (let i = 0; i < plexusNodes.length; i++) {
         const p = plexusNodes[i];
-        const nodeAlpha = 0.4 + avgEnergy * 0.6;
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.radius + avgEnergy * 2, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(${primaryRGB}, ${nodeAlpha})`;
         ctx.fill();
     }
     ctx.shadowBlur = 0;
@@ -2483,16 +2578,20 @@ function drawAudioPlexus(bassAvg) {
 // MODE C: Fractal Echo (Geometric Tunnel)
 // =============================================
 let fractalAngle = 0;
+const FRACTAL_SIDES = 6;
+const FRACTAL_HEX_COS = new Float32Array(FRACTAL_SIDES + 1);
+const FRACTAL_HEX_SIN = new Float32Array(FRACTAL_SIDES + 1);
+for (let s = 0; s <= FRACTAL_SIDES; s++) {
+    const a = (s / FRACTAL_SIDES) * Math.PI * 2;
+    FRACTAL_HEX_COS[s] = Math.cos(a);
+    FRACTAL_HEX_SIN[s] = Math.sin(a);
+}
 
 function drawFractalEcho(bassAvg) {
-    const primaryRGB = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim();
-    const glowRGB = getComputedStyle(document.documentElement).getPropertyValue('--theme-glow').trim();
-
     const cx = w / 2;
     const cy = h / 2;
     const maxRadius = Math.min(w, h) * 0.48;
     const ringCount = 18;
-    const sides = 6; // Hexagons
 
     // Mid-range frequency for gap pulsing
     const midAvg = getAverageFrequency(40, 100);
@@ -2503,7 +2602,7 @@ function drawFractalEcho(bassAvg) {
     ctx.save();
     ctx.translate(cx, cy);
     ctx.shadowBlur = 12;
-    ctx.shadowColor = `rgba(${glowRGB}, 0.6)`;
+    ctx.shadowColor = `rgba(${cachedThemeGlow}, 0.6)`;
 
     for (let ring = 0; ring < ringCount; ring++) {
         const t = ring / ringCount;
@@ -2520,17 +2619,20 @@ function drawFractalEcho(bassAvg) {
         const lineWidth = 0.5 + audioVal * 2.5;
 
         const alpha = 0.15 + (1 - t) * 0.7;
+        const cosRot = Math.cos(rotationSpeed);
+        const sinRot = Math.sin(rotationSpeed);
 
         ctx.beginPath();
-        for (let s = 0; s <= sides; s++) {
-            const angle = (s / sides) * Math.PI * 2 + rotationSpeed;
-            const px = Math.cos(angle) * radius;
-            const py = Math.sin(angle) * radius;
+        for (let s = 0; s <= FRACTAL_SIDES; s++) {
+            const hCos = FRACTAL_HEX_COS[s];
+            const hSin = FRACTAL_HEX_SIN[s];
+            const px = (hCos * cosRot - hSin * sinRot) * radius;
+            const py = (hSin * cosRot + hCos * sinRot) * radius;
             if (s === 0) ctx.moveTo(px, py);
             else ctx.lineTo(px, py);
         }
         ctx.closePath();
-        ctx.strokeStyle = `rgba(${primaryRGB}, ${alpha})`;
+        ctx.strokeStyle = `rgba(${cachedThemePrimary}, ${alpha})`;
         ctx.lineWidth = lineWidth;
         ctx.stroke();
     }
@@ -2543,28 +2645,30 @@ function drawFractalEcho(bassAvg) {
 // MODE D: Liquid Nebula (Organic Soundwaves)
 // =============================================
 let nebulaTime = 0;
+const NEBULA_BANDS = [0, 0, 0, 0, 0];
 
 function drawLiquidNebula(bassAvg) {
-    const primaryRGB = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim();
-    const glowRGB = getComputedStyle(document.documentElement).getPropertyValue('--theme-glow').trim();
-
     const cx = w / 2;
     const cy = h / 2;
     const blobCount = 5;
 
     nebulaTime += 0.012;
 
-    // Frequency bands
+    // Frequency bands (reused static array)
     const bass = getAverageFrequency(0, 15) / 255;
     const lowMid = getAverageFrequency(15, 60) / 255;
     const highMid = getAverageFrequency(60, 120) / 255;
-    const bands = [bass, lowMid, highMid, (bass + lowMid) / 2, (lowMid + highMid) / 2];
+    NEBULA_BANDS[0] = bass;
+    NEBULA_BANDS[1] = lowMid;
+    NEBULA_BANDS[2] = highMid;
+    NEBULA_BANDS[3] = (bass + lowMid) * 0.5;
+    NEBULA_BANDS[4] = (lowMid + highMid) * 0.5;
 
     ctx.save();
     ctx.globalCompositeOperation = 'screen';
 
     for (let b = 0; b < blobCount; b++) {
-        const band = bands[b];
+        const band = NEBULA_BANDS[b];
         const phase = nebulaTime + b * 1.2;
 
         // Organic movement offsets
@@ -2580,8 +2684,8 @@ function drawLiquidNebula(bassAvg) {
         // Radial gradient for soft glow
         const grad = ctx.createRadialGradient(bx, by, 0, bx, by, radius);
         const alpha = 0.15 + band * 0.35;
-        grad.addColorStop(0, `rgba(${b % 2 === 0 ? primaryRGB : glowRGB}, ${Math.min(alpha + 0.1, 0.6)})`);
-        grad.addColorStop(0.4, `rgba(${primaryRGB}, ${alpha * 0.6})`);
+        grad.addColorStop(0, `rgba(${b % 2 === 0 ? cachedThemePrimary : cachedThemeGlow}, ${Math.min(alpha + 0.1, 0.6)})`);
+        grad.addColorStop(0.4, `rgba(${cachedThemePrimary}, ${alpha * 0.6})`);
         grad.addColorStop(1, 'transparent');
 
         ctx.beginPath();
@@ -2688,6 +2792,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 activeThemeHour = -1; // Reset active theme hour to force update
                 setDynamicTheme(new Date().getHours());
             }
+            isColorOverrideOn = colorToggle.checked;
+            updateCachedThemeColors();
         };
 
         colorToggle.addEventListener('change', (e) => {
@@ -2699,6 +2805,7 @@ document.addEventListener('DOMContentLoaded', () => {
             // Only change live if the override toggle is actually ON
             if (colorToggle.checked) {
                 document.documentElement.style.setProperty('--theme-primary', hexToRgb(e.target.value));
+                updateCachedThemeColors();
                 if (typeof drawWaveformBars === 'function') drawWaveformBars();
             }
         });
@@ -2768,8 +2875,17 @@ document.addEventListener('DOMContentLoaded', () => {
     // Feature 4: Toggle Canvas Effects on/off
     if (visualizerToggle && canvas) {
         visualizerToggle.addEventListener('change', (e) => {
-            canvas.style.opacity = e.target.checked ? '1' : '0';
+            const isVisible = e.target.checked;
+            isCanvasVisible = isVisible;
+            canvas.style.opacity = isVisible ? '1' : '0';
             canvas.style.transition = 'opacity 0.3s ease';
+            if (isVisible) {
+                if (heroScreen && heroScreen.classList.contains('fade-out')) {
+                    startVisualizerLoop();
+                }
+            } else {
+                stopVisualizerLoop();
+            }
         });
     }
 
@@ -2828,7 +2944,7 @@ function drawWaveformBars() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     
     // Fetch live color
-    const themeColor = getComputedStyle(document.documentElement).getPropertyValue('--theme-primary').trim() || '255, 255, 255';
+    const themeColor = cachedThemePrimary || '255, 255, 255';
     
     // Set glowing light effect
     ctx.shadowBlur = 12;
@@ -2860,33 +2976,67 @@ document.addEventListener('DOMContentLoaded', () => {
     if (window.parallaxLoopRunning) return; 
     window.parallaxLoopRunning = true;
 
-    const parentContainer = document.querySelector('.floating-container'); // Or your exact wrapper class
+    const parentContainer = document.querySelector('.floating-container');
     if (!parentContainer) return;
+    const hero = document.getElementById('hero-screen');
 
     let targetX = 0, targetY = 0;
     let currentX = 0, currentY = 0;
+    let parallaxAnimId = null;
+
+    // Single smooth loop that automatically idles when converged or hero hidden
+    function renderParallax() {
+        if (hero && hero.classList.contains('fade-out')) {
+            parallaxAnimId = null;
+            return;
+        }
+        if (document.hidden) {
+            parallaxAnimId = null;
+            return;
+        }
+
+        currentX += (targetX - currentX) * 0.1;
+        currentY += (targetY - currentY) * 0.1;
+        
+        const diffX = Math.abs(targetX - currentX);
+        const diffY = Math.abs(targetY - currentY);
+
+        if (diffX > 0.01 || diffY > 0.01) {
+            parentContainer.style.transform = `rotateY(${currentX.toFixed(2)}deg) rotateX(${currentY.toFixed(2)}deg)`;
+            parallaxAnimId = requestAnimationFrame(renderParallax);
+        } else {
+            // Settled at target
+            currentX = targetX;
+            currentY = targetY;
+            parentContainer.style.transform = `rotateY(${currentX.toFixed(2)}deg) rotateX(${currentY.toFixed(2)}deg)`;
+            parallaxAnimId = null;
+        }
+    }
+
+    function wakeParallax() {
+        if (parallaxAnimId === null && (!hero || !hero.classList.contains('fade-out')) && !document.hidden) {
+            parallaxAnimId = requestAnimationFrame(renderParallax);
+        }
+    }
 
     // Extremely lightweight tracking
     document.addEventListener('mousemove', (e) => {
+        if (hero && hero.classList.contains('fade-out')) return;
         targetX = (window.innerWidth / 2 - e.pageX) / 90; 
         targetY = (window.innerHeight / 2 - e.pageY) / 90;
+        wakeParallax();
     });
 
     document.addEventListener('mouseleave', () => {
         targetX = 0; targetY = 0;
+        wakeParallax();
     });
 
-    // Single smooth loop
-    function renderParallax() {
-        currentX += (targetX - currentX) * 0.1;
-        currentY += (targetY - currentY) * 0.1;
-        
-        if (Math.abs(targetX - currentX) > 0.01 || Math.abs(targetY - currentY) > 0.01) {
-            parentContainer.style.transform = `rotateY(${currentX.toFixed(2)}deg) rotateX(${currentY.toFixed(2)}deg)`;
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+            wakeParallax();
         }
-        
-        requestAnimationFrame(renderParallax);
-    }
+    });
     
-    renderParallax();
+    wakeParallax();
 });
